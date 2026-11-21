@@ -78,14 +78,17 @@ class ThreatTracker:
     """Tracks enemy mechs, sound threats, combat timers, rear attacks, and incoming projectiles."""
 
     MEMORY_TTL = 12.0
+    NPC_TTL = 6.0
     SOUND_TTL = 3.0
 
     def __init__(self, world: WorldModel, config: Dict[str, Any]):
         self.world = world
         self.config = config
         self.enemies: Dict[int, TrackedEnemy] = {}
+        self.npcs: Dict[int, Dict[str, Any]] = {}
         self.sounds: List[SoundPing] = []
         self.last_damaged_t: float = -100.0
+        self.last_npc_damaged_t: float = -100.0
         self.last_dealt_damage_t: float = -100.0
         self.last_hit_by: Dict[int, float] = {}
         self.rear_alert_bearing: Optional[float] = None
@@ -105,13 +108,27 @@ class ThreatTracker:
         me = obs["self"]
         mx, my, mz = me["pos"]
 
-        # Mark all previously tracked enemies as not currently visible
+        # Mark all previously tracked enemies and NPCs as not currently visible
         for e in self.enemies.values():
             e.visible_now = False
+        for n in self.npcs.values():
+            n["visible_now"] = False
 
-        # Update visible mechs
+        # Update visible mechs and NPC drones
         for m in obs.get("mechs") or []:
-            if m.get("kind") != "mech":
+            kind = m.get("kind")
+            if kind == "npc":
+                nid = int(m["id"])
+                p = m["pos"]
+                self.npcs[nid] = {
+                    "id": nid,
+                    "pos": (float(p[0]), float(p[1]), float(p[2])),
+                    "hp": float(m.get("hp", 350.0)),
+                    "last_seen_t": now,
+                    "visible_now": True,
+                }
+                continue
+            if kind != "mech":
                 continue
             eid = int(m["id"])
             if eid in self.enemies:
@@ -123,12 +140,17 @@ class ThreatTracker:
         stale = [eid for eid, e in self.enemies.items() if now - e.last_seen_t > self.MEMORY_TTL]
         for eid in stale:
             del self.enemies[eid]
+        stale_npc = [nid for nid, n in self.npcs.items() if now - n["last_seen_t"] > self.NPC_TTL]
+        for nid in stale_npc:
+            del self.npcs[nid]
 
         # Process events
         for ev in obs.get("events") or []:
             etype = ev.get("type")
             if etype == "damaged":
                 self.last_damaged_t = now
+                if ev.get("weapon") == "npc":
+                    self.last_npc_damaged_t = now
                 amt = float(ev.get("amount", 0.0))
                 self._damage_events.append((now, amt))
                 attacker = ev.get("by")
@@ -193,7 +215,10 @@ class ThreatTracker:
     def recent_attackers(self, now: float, window: float = 5.0) -> set[int]:
         return {eid for eid, t in self.last_hit_by.items() if now - t <= window}
 
-    def snapshot_sources(self, now: float) -> List[Tuple[float, float, float, float, float]]:
+    def visible_npcs(self) -> List[Dict[str, Any]]:
+        return [n for n in self.npcs.values() if n["visible_now"]]
+
+    def snapshot_sources(self, now: float, include_npcs: bool = False, npc_weight: float = 5.0) -> List[Tuple[float, float, float, float, float]]:
         """Compact list of (x, y, radius, r_sq, weight) for ultra-fast inline A* danger evaluation."""
         sources: List[Tuple[float, float, float, float, float]] = []
         for e in self.enemies.values():
@@ -205,6 +230,11 @@ class ThreatTracker:
             sources.append((e.pos[0], e.pos[1], 160.0, 25600.0, decay * mult * 6.0))
             if "lightning" in e.weapons:
                 sources.append((e.pos[0], e.pos[1], 55.0, 3025.0, decay * 4.5))
+        if include_npcs:
+            for n in self.npcs.values():
+                age = max(0.0, now - n["last_seen_t"])
+                decay = 1.0 if n["visible_now"] else max(0.2, 1.0 - age / self.NPC_TTL)
+                sources.append((n["pos"][0], n["pos"][1], 52.0, 2704.0, decay * npc_weight))
         for s in self.sounds:
             age = max(0.0, now - s.t)
             decay = max(0.0, 1.0 - age / self.SOUND_TTL)
@@ -212,7 +242,7 @@ class ThreatTracker:
                 sources.append((s.x, s.y, 120.0, 14400.0, decay * s.weight * 1.2))
         return sources
 
-    def danger_at(self, x: float, y: float, now: float) -> float:
+    def danger_at(self, x: float, y: float, now: float, include_npcs: bool = False, npc_weight: float = 4.5) -> float:
         """Non-negative threat penalty for A* routing and safe-position scoring."""
         score = 0.0
         for e in self.enemies.values():
@@ -232,6 +262,20 @@ class ThreatTracker:
                 if e.charging and d < 180.0:
                     mult *= 1.4
                 score += decay * mult * (prox * prox) * 6.0
+
+        if include_npcs:
+            for n in self.npcs.values():
+                dx = n["pos"][0] - x
+                dy = n["pos"][1] - y
+                if dx > 52.0 or dx < -52.0 or dy > 52.0 or dy < -52.0:
+                    continue
+                d2 = dx * dx + dy * dy
+                if d2 < 2704.0:
+                    d = math.sqrt(d2)
+                    age = max(0.0, now - n["last_seen_t"])
+                    decay = 1.0 if n["visible_now"] else max(0.2, 1.0 - age / self.NPC_TTL)
+                    prox = (52.0 - d) / 52.0
+                    score += decay * npc_weight * (prox * prox)
 
         for s in self.sounds:
             dx = s.x - x

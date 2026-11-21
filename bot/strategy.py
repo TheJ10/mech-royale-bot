@@ -29,7 +29,7 @@ class StrategyProfile:
 PROFILES: Dict[str, StrategyProfile] = {
     "tactical_survivor": StrategyProfile(
         name="tactical_survivor",
-        bot_name="tactical-surv-v2",
+        bot_name="tactical-v2-npc",
         pacifist=False,
         retreat_hp_frac=0.45,
         outnumbered_hp_frac=0.72,
@@ -137,7 +137,7 @@ class StrategyController:
                 wx, wy = self.world.grid_to_world(gx, gy) if self.world.loaded else (cx, cy)
                 if math.hypot(wx - zcx, wy - zcy) > max(6.0, next_radius - 10.0):
                     continue
-                danger = self.threats.danger_at(wx, wy, now)
+                danger = self.threats.danger_at(wx, wy, now, include_npcs=True, npc_weight=4.5)
                 dist_me = math.hypot(wx - mx, wy - my)
                 has_cover = bool(self.world.loaded and self.world.cover_adj[gy * self.world.nav_nx + gx])
                 score = (28.0 if has_cover else 0.0) - danger * 24.0 - dist_me * 0.14
@@ -214,6 +214,25 @@ class StrategyController:
         # Incoming projectile / charging laser dodge
         dodge_vec = self.threats.compute_dodge_vector(obs, next_center)
 
+        # NPC threat evaluation: treat visible LoS NPCs within 50m as a retreat threat when hurt
+        nearest_npc = None
+        nearest_npc_dist = 1e9
+        for n in self.threats.visible_npcs():
+            dn = math.hypot(n["pos"][0] - x, n["pos"][1] - y)
+            if dn < nearest_npc_dist:
+                nearest_npc_dist = dn
+                nearest_npc = n
+        npc_threat_active = False
+        if nearest_npc is not None and nearest_npc_dist < 52.0:
+            npc_has_los = (not self.world.loaded) or self.world.has_los(
+                (nearest_npc["pos"][0], nearest_npc["pos"][1], nearest_npc["pos"][2] + 2.0),
+                (x, y, z + 4.5),
+                step=4.0,
+            )
+            recent_npc_hit = (now - self.threats.last_npc_damaged_t) <= 3.0
+            if npc_has_los and (hp_frac < 0.55 or (recent_npc_hit and hp_frac < 0.70)):
+                npc_threat_active = True
+
         # Evaluate retreat condition
         close_enemies = [e for e in vis_enemies if math.hypot(e.pos[0] - x, e.pos[1] - y) < 85.0]
         outnumbered = len(close_enemies) >= 2 and hp_frac < self.profile.outnumbered_hp_frac
@@ -233,6 +252,7 @@ class StrategyController:
             or low_hp_threat
             or outnumbered
             or bad_duel
+            or npc_threat_active
         )
 
         # Target selection (if not pacifist)
@@ -283,11 +303,16 @@ class StrategyController:
 
         elif want_retreat:
             self.mode = "RETREAT_HEAL"
-            threat_ref = nearest_enemy.pos if nearest_enemy is not None else (
-                x + math.cos(self.threats.rear_alert_bearing or 0.0) * 40.0,
-                y + math.sin(self.threats.rear_alert_bearing or 0.0) * 40.0,
-                z,
-            )
+            if nearest_enemy is not None:
+                threat_ref = nearest_enemy.pos
+            elif npc_threat_active and nearest_npc is not None:
+                threat_ref = nearest_npc["pos"]
+            else:
+                threat_ref = (
+                    x + math.cos(self.threats.rear_alert_bearing or 0.0) * 40.0,
+                    y + math.sin(self.threats.rear_alert_bearing or 0.0) * 40.0,
+                    z,
+                )
             if self._cover_pt is None or (now - self._cover_t) > 1.5 or math.hypot(self._cover_pt[0] - x, self._cover_pt[1] - y) < 6.0:
                 self._cover_pt = self.world.find_cover_point(pos3, threat_ref, play_center, play_radius)
                 self._cover_t = now
@@ -417,7 +442,8 @@ class StrategyController:
         suppress_stuck = charging_laser or self.mode == "COMBAT_KITE" or (
             self.profile.silent_when_hidden and self.mode == "SAFE_ROTATE"
         )
-        danger_sources = self.threats.snapshot_sources(now)
+        avoid_npcs = (self.mode != "LOOT_NPC") and (hp_frac < 0.72 or self.mode in ("RETREAT_HEAL", "SAFE_ROTATE", "ZONE_URGENT"))
+        danger_sources = self.threats.snapshot_sources(now, include_npcs=avoid_npcs, npc_weight=6.0 if hp_frac < 0.60 else 4.0)
         move_xy, boost, jump, _ = self.nav.update_and_steer(
             tick=tick,
             pos=pos3,
