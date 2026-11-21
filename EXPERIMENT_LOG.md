@@ -7,7 +7,9 @@
 | Official starter | `main` / `baseline/official-starter` | `14a4d1ef8a8dd0d8d37170b74f4feb95bb554991` | **1.15** | Untouched official Python starter (current best official score) |
 | Defensive survival v1 | `baseline/survival-v1` | `eaca8b212e83f6986fb404efc6d26e6f385b3c1c` | **0.85** | Teammate's survival prototype (underperformed starter) |
 | Tactical Survivor v2 (Iter 1) | `experiment/tactical-survivor-v2` | `890088ef5677488d495fbb8cd6f1caa9e5a6a61e` | *Pending manual submission* | Modular map/nav/threat/combat/resource stack + 10 bug-hunter fixes (Docker P99 31.0 ms, 0 late) |
-| Tactical Survivor v2 (Iter 2) | `experiment/tactical-survivor-v2` | *Latest commit on branch* | *Pending manual submission* | 7 m slope-aware navgrid, inline cached A* danger, gravity-corrected lead, rear-armor offense, supply-drop capture holding (Docker P99 32.2 ms, 0 late) |
+| Tactical Survivor v2 (Iter 2) | `experiment/tactical-survivor-v2` | `8abe44e217e5b0b97ad86cac7d3453273bfb27cf` | *Pending manual submission* | 7 m slope-aware navgrid, inline cached A* danger, gravity-corrected lead, rear-armor offense, supply-drop capture holding (Docker P99 32.2 ms, 0 late) |
+| Pure Pacifist v1 | `experiment/pure-pacifist-v1` | `4c3e36cc8f57fd500b3723eb8aaab1b225859421` | *Pending manual submission* | Zero-fire evasive survival bot, silent movement, cover retreat (Docker P99 23.1 ms, 0 late) |
+| Opportunistic Hunter v1 | `experiment/opportunistic-hunter-v1` | `cf14bf70e2825fa52fb12db83509456629dd8712` | *Pending manual submission* | Favorable-EV hunter, rear-armor & wounded target priority, aggressive looting (Docker P99 29.4 ms, 0 late) |
 
 ---
 
