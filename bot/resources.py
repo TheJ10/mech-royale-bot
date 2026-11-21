@@ -143,6 +143,7 @@ class ResourcePlanner:
         zone_center: Vec2,
         safe_radius: float,
         max_detour: float = 55.0,
+        allow_noisy_farm: bool = True,
     ) -> Optional[LootObjective]:
         """Score visible cubes, desirable weapon pickups, crates, NPC drones, and nearby drops."""
         me = obs["self"]
@@ -151,14 +152,19 @@ class ResourcePlanner:
         hp_frac = float(me["hp"]) / max(1.0, float(me["max_hp"]))
         held_kinds = {w["kind"] for w in me["weapons"] if w is not None}
         need_secondary = me["weapons"][1] is None or me["weapons"][1]["kind"] == "mortar"
+        on_roof = self.world.loaded and (z - self.world.terrain_height(x, y)) > 3.0
 
         best: Optional[LootObjective] = None
 
         def consider(kind: str, pos: Vec3, tid: Optional[int], base_val: float, max_d: float) -> None:
             nonlocal best
             px, py, pz = pos
-            # Filter rooftop items using local terrain height rather than our current Z (handles campus slopes!)
-            if self.world.loaded:
+            # If on a rooftop, only consider loot at our elevation (don't jump off for ground crates)
+            if on_roof:
+                if abs(pz - z) > 4.5:
+                    return
+            elif self.world.loaded:
+                # Filter rooftop items using local terrain height rather than our current Z (handles campus slopes!)
                 if (pz - self.world.terrain_height(px, py)) > 2.8:
                     return
             elif abs(pz - z) > 4.5:
@@ -187,13 +193,13 @@ class ResourcePlanner:
                 if k in ("lightning", "laser") and k not in held_kinds:
                     consider("pickup", tuple(p["pos"]), int(p["id"]), 78.0, max_detour)
 
-        # 3. Crates (300 HP -> 1 cube + 50% weapon; quick to break with gun)
-        if not self.pacifist and hp_frac >= 0.55:
+        # 3. Crates (300 HP -> 1 cube + 50% weapon; skip noisy crate shooting when enemies are nearby!)
+        if allow_noisy_farm and not self.pacifist and hp_frac >= 0.55:
             for cr in obs.get("crates") or []:
                 consider("crate", tuple(cr["pos"]), int(cr["id"]), 62.0, min(48.0, max_detour))
 
         # 4. NPC drones (350 HP -> 2 cubes! Only when very healthy and completely quiet)
-        if not self.pacifist and hp_frac >= 0.80 and not threats.visible_enemies() and threats.danger_at(x, y, now) < 1.0:
+        if allow_noisy_farm and not self.pacifist and hp_frac >= 0.80 and not threats.visible_enemies() and threats.danger_at(x, y, now) < 1.0:
             for m in obs.get("mechs") or []:
                 if m.get("kind") == "npc":
                     consider("npc", tuple(m["pos"]), int(m["id"]), 64.0, min(46.0, max_detour))

@@ -192,7 +192,11 @@ class CombatPlanner:
             # Selective survival discipline: avoid initiating noisy mid/long-range duels
             # against healthy non-threatening enemies in early/mid game (protects placement!)
             if selective and alive > 4 and e.id not in attackers:
-                threatening_me = (dist < 52.0) or (dist < 85.0 and e_facing_err < 0.35)
+                threatening_me = (
+                    (dist < 52.0)
+                    or (dist < 85.0 and e_facing_err < 0.35)
+                    or (e.charging and e_facing_err < 0.35 and dist <= 245.0)
+                )
                 vulnerable = (e.hp <= 550.0) or (hp_frac < 0.48)
                 rear_ambush = (e_facing_err > math.pi * 0.5 and dist < 95.0 and my_hp_frac >= 0.72)
                 cookoff_shot = ("laser" in my_weapons and "mortar" in e.weapons and dist < 135.0)

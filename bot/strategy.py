@@ -31,7 +31,7 @@ class StrategyProfile:
 PROFILES: Dict[str, StrategyProfile] = {
     "tactical_survivor": StrategyProfile(
         name="tactical_survivor",
-        bot_name="tactical-surv-v3",
+        bot_name="tactical-surv-v3.1",
         pacifist=False,
         selective_engage=True,
         hold_silent_at_cover=True,
@@ -209,15 +209,23 @@ class StrategyController:
         sec_until_shrink = shrink_start - now
 
         # In final phase (next_radius <= 10), allow normal combat/kiting while inside active circle
+        # BH-006: keep final-zone urgency active even when active_r <= 12m so bot never steps into 260 HP/s zone
         if next_radius <= 10.0:
-            zone_urgent = (not in_zone) or (dist_to_active_edge < 10.0 and active_r > 12.0)
+            edge_margin = min(10.0, active_r * 0.35)
+            zone_urgent = (not in_zone) or (active_r > 3.5 and dist_to_active_edge < edge_margin)
         else:
             zone_urgent = (not in_zone) or (dist_to_next_safe > 0.0 and sec_until_shrink <= walk_s + 12.0)
 
         # Use active circle for loot/cover/kiting when plenty of time remains before shrink
         play_center = active_center if sec_until_shrink > walk_s + 15.0 else next_center
         play_radius = active_r if sec_until_shrink > walk_s + 15.0 else max(next_radius, active_r if next_radius <= 10.0 else next_radius)
+        # Strict safe play radius (never exceeds play_radius when final circle is tiny!)
+        safe_play_r = max(0.0, play_radius - min(10.0, play_radius * 0.30))
         laser_shorted = now < self.threats.laser_short_until_t
+        charging_laser = any(w and w["kind"] == "laser" and float(w.get("charge", 0.0)) > 0.0 for w in me["weapons"])
+        laser_ready = (not laser_shorted) and any(
+            w and w["kind"] == "laser" and float(w.get("cooldown", 0.0)) <= 0.05 for w in me["weapons"]
+        )
 
         vis_enemies = self.threats.visible_enemies()
         nearest_enemy: Optional[TrackedEnemy] = None
@@ -262,20 +270,22 @@ class StrategyController:
                 selective=self.profile.selective_engage,
             )
 
-        # Loot evaluation when safe
+        # Loot evaluation when safe (BH-003: never shoot noisy crates/NPCs while an enemy is within 85m!)
         loot_obj: Optional[LootObjective] = None
         if not zone_urgent and not want_retreat and (mech_target is None or nearest_dist > 85.0):
             loot_obj = self.resources.find_best_loot(
                 obs,
                 self.threats,
                 play_center,
-                max(5.0, play_radius - 10.0),
+                safe_play_r,
                 max_detour=self.profile.loot_detour_m,
+                allow_noisy_farm=(nearest_dist > 85.0),
             )
 
         # --- MODE SELECTION ---
         goal: Vec2 = next_center
         want_boost = False
+        hold_retreat_cover = False
         combat_plan = CombatPlan()
         danger_weight = self.profile.danger_nav_weight
 
@@ -306,22 +316,46 @@ class StrategyController:
                 y + math.sin(self.threats.rear_alert_bearing or 0.0) * 40.0,
                 z,
             )
-            if self._cover_pt is None or (now - self._cover_t) > 1.5 or math.hypot(self._cover_pt[0] - x, self._cover_pt[1] - y) < 6.0:
-                self._cover_pt = self.world.find_cover_point(pos3, threat_ref, play_center, play_radius)
+            t_eye = (threat_ref[0], threat_ref[1], threat_ref[2] + 7.5)
+            in_safe_play = math.hypot(x - play_center[0], y - play_center[1]) <= max(1.0, safe_play_r)
+            already_in_cover = (
+                self.world.loaded
+                and in_safe_play
+                and dodge_vec is None
+                and not self.world.has_los(t_eye, (x, y, z + 5.0), step=3.5)
+            )
+            if already_in_cover:
+                # BH-001: Already safely behind cover -> HOLD STILL silently to trigger 5s HP regen!
+                goal = (x, y)
+                self._cover_pt = (x, y)
                 self._cover_t = now
-            cover_pt = self._cover_pt
-            if cover_pt is not None:
-                goal = cover_pt
+                want_boost = False
+                hold_retreat_cover = True
             else:
-                # Back away toward quiet zone anchor
-                away_yaw = math.atan2(y - threat_ref[1], x - threat_ref[0])
-                cand_x = x + math.cos(away_yaw) * 45.0
-                cand_y = y + math.sin(away_yaw) * 45.0
-                if math.hypot(cand_x - play_center[0], cand_y - play_center[1]) <= max(10.0, play_radius - 8.0):
-                    goal = self.world.clamp_to_bounds(cand_x, cand_y)
+                # Retain existing cover anchor while it remains inside safe zone and blocks LoS from threat
+                cover_still_valid = False
+                if self._cover_pt is not None and (now - self._cover_t) <= 3.0:
+                    cx, cy = self._cover_pt
+                    if math.hypot(cx - play_center[0], cy - play_center[1]) <= max(1.0, safe_play_r):
+                        cz = self.world.terrain_height(cx, cy) if self.world.loaded else z
+                        if (not self.world.loaded) or (not self.world.has_los(t_eye, (cx, cy, cz + 5.0), step=3.5)):
+                            cover_still_valid = True
+                if not cover_still_valid:
+                    self._cover_pt = self.world.find_cover_point(pos3, threat_ref, play_center, play_radius)
+                    self._cover_t = now
+                cover_pt = self._cover_pt
+                if cover_pt is not None:
+                    goal = cover_pt
                 else:
-                    goal = self._pick_quiet_zone_anchor(obs, next_center, next_radius)
-            want_boost = energy > 22.0 and (nearest_dist < 70.0 or dodge_vec is not None)
+                    # Back away toward quiet zone anchor (strictly clamped inside safe_play_r)
+                    away_yaw = math.atan2(y - threat_ref[1], x - threat_ref[0])
+                    cand_x = x + math.cos(away_yaw) * min(45.0, max(6.0, safe_play_r))
+                    cand_y = y + math.sin(away_yaw) * min(45.0, max(6.0, safe_play_r))
+                    if math.hypot(cand_x - play_center[0], cand_y - play_center[1]) <= max(1.0, safe_play_r):
+                        goal = self.world.clamp_to_bounds(cand_x, cand_y)
+                    else:
+                        goal = self._pick_quiet_zone_anchor(obs, next_center, next_radius)
+                want_boost = energy > 22.0 and (nearest_dist < 70.0 or dodge_vec is not None)
             danger_weight = 3.5
 
             # Protect rear armor: face nearest threat! Fire ONLY if very close or enemy is finishable
@@ -357,18 +391,32 @@ class StrategyController:
                 allow_fire=True,
                 laser_shorted=laser_shorted,
             )
-            # Check if primary weapon is reloading/on-cooldown -> duck behind cover while reloading!
+            # BH-005: Check if primary gun is reloading -> duck behind cover ONLY if not charging/readying laser or lightning!
             gun_reloading = any(w and w["kind"] == "gun" and float(w.get("reload", 0.0)) > 0.35 for w in me["weapons"])
             can_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"]) and math.hypot(mech_target.pos[0] - x, mech_target.pos[1] - y) < 43.0
-            if gun_reloading and not can_lightning and self.world.loaded:
-                if self._cover_pt is None or (now - self._cover_t) > 1.2:
-                    self._cover_pt = self.world.find_cover_point(pos3, mech_target.pos, play_center, play_radius, search_radius=36.0)
-                    self._cover_t = now
-                if self._cover_pt is not None:
-                    goal = self._cover_pt
-                    want_boost = dodge_vec is not None and energy > 25.0
+            laser_active = charging_laser or (laser_ready and combat_plan.weapon_kind == "laser")
+            if gun_reloading and not can_lightning and not laser_active and self.world.loaded:
+                t_eye_c = (mech_target.pos[0], mech_target.pos[1], mech_target.pos[2] + 7.5)
+                if not self.world.has_los(t_eye_c, (x, y, z + 5.0), step=3.5) and math.hypot(x - play_center[0], y - play_center[1]) <= max(1.0, safe_play_r):
+                    goal = (x, y)
+                    want_boost = False
                 else:
-                    goal = self.world.clamp_to_bounds(x - (mech_target.pos[0] - x) * 0.3, y - (mech_target.pos[1] - y) * 0.3)
+                    cover_c = self.world.find_cover_point(pos3, mech_target.pos, play_center, play_radius, search_radius=36.0)
+                    if cover_c is not None:
+                        goal = cover_c
+                        want_boost = dodge_vec is not None and energy > 25.0
+                    else:
+                        # Normalized fallback step away from enemy, strictly clamped inside safe_play_r!
+                        away_dx = x - mech_target.pos[0]
+                        away_dy = y - mech_target.pos[1]
+                        away_n = max(1.0, math.hypot(away_dx, away_dy))
+                        step_d = min(18.0, max(4.0, safe_play_r))
+                        fx = x + (away_dx / away_n) * step_d
+                        fy = y + (away_dy / away_n) * step_d
+                        if math.hypot(fx - play_center[0], fy - play_center[1]) > safe_play_r:
+                            fx, fy = play_center
+                        goal = self.world.clamp_to_bounds(fx, fy)
+                        want_boost = dodge_vec is not None and energy > 25.0
             else:
                 # Flip strafe direction every ~1.4s so enemy lead misses
                 if now - self._last_strafe_flip_t > 1.4:
@@ -401,10 +449,12 @@ class StrategyController:
                 elif d < desired_r - 10.0:
                     radial = -0.65
 
-                gx = x + (px * 0.85 + ux * radial) * 24.0
-                gy = y + (py * 0.85 + uy * radial) * 24.0
-                if math.hypot(gx - play_center[0], gy - play_center[1]) > max(8.0, play_radius - 10.0):
-                    gx, gy = next_center
+                step_k = min(24.0, max(4.0, safe_play_r))
+                gx = x + (px * 0.85 + ux * radial) * step_k
+                gy = y + (py * 0.85 + uy * radial) * step_k
+                # BH-006: strictly clamp kiting inside safe_play_r (never outside tiny final circle!)
+                if math.hypot(gx - play_center[0], gy - play_center[1]) > safe_play_r:
+                    gx, gy = play_center
                 goal = self.world.clamp_to_bounds(gx, gy)
                 want_boost = dodge_vec is not None and energy > 25.0
 
@@ -441,12 +491,12 @@ class StrategyController:
                 )
 
         else:
-            # Rooftop high-ground hold: if safely on a roof inside the safe zone with low threat, hold it!
-            on_roof = self.world.loaded and (z - self.world.terrain_height(x, y)) > 3.0
+            # Rooftop high-ground hold: only when GROUNDED on a roof inside safe_play_r with low threat
+            on_roof = grounded and self.world.loaded and (z - self.world.terrain_height(x, y)) > 3.0
             if (
                 on_roof
                 and in_zone
-                and math.hypot(x - play_center[0], y - play_center[1]) <= max(8.0, play_radius - 14.0)
+                and math.hypot(x - play_center[0], y - play_center[1]) <= max(4.0, safe_play_r)
                 and self.threats.danger_at(x, y, now) < 2.5
             ):
                 self.mode = "ROOF_HOLD"
@@ -458,8 +508,7 @@ class StrategyController:
                 want_boost = False
 
         # --- NAVIGATION ---
-        charging_laser = any(w and w["kind"] == "laser" and float(w.get("charge", 0.0)) > 0.0 for w in me["weapons"])
-        hold_quiet_cover = (
+        hold_quiet_cover = hold_retreat_cover or (
             self.profile.hold_silent_at_cover
             and self.mode in ("SAFE_ROTATE", "ROOF_HOLD")
             and dodge_vec is None
@@ -469,6 +518,8 @@ class StrategyController:
             self.profile.silent_when_hidden and self.mode == "SAFE_ROTATE"
         )
         if hold_quiet_cover:
+            # BH-002: reset nav motion history while intentionally holding stationary cover
+            self.nav.reset_motion_history()
             move_xy, boost, jump = [0.0, 0.0], False, False
         else:
             danger_sources = self.threats.snapshot_sources(now)
@@ -492,11 +543,14 @@ class StrategyController:
             scale = min(1.0, 4.2 / walk_speed)
             move_xy = [move_xy[0] * scale, move_xy[1] * scale]
 
-        # --- AIM FALLBACK (Rear-armor protection + 360° scanning) ---
+        # --- AIM FALLBACK (BH-003: Rear-armor protection toward nearest visible enemy + 360° scanning) ---
         if combat_plan.aim is not None:
             aim = combat_plan.aim
         elif self.threats.rear_alert_bearing is not None:
             aim = [self.threats.rear_alert_bearing, 0.0]
+        elif nearest_enemy is not None and nearest_dist < 160.0:
+            # Maintain front-arc facing toward visible threat even when choosing to hold fire!
+            aim = [math.atan2(nearest_enemy.pos[1] - y, nearest_enemy.pos[0] - x), 0.0]
         else:
             # Smooth torso scan around movement heading so 120° FOV sweeps 360°
             move_yaw = math.atan2(move_xy[1], move_xy[0]) if math.hypot(move_xy[0], move_xy[1]) > 0.1 else float(me["aim"][0])
