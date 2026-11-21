@@ -38,9 +38,10 @@ class Navigator:
         goal: Vec2,
         danger_fn: Optional[Callable[[float, float], float]] = None,
         danger_weight: float = 1.0,
-        max_expansions: int = 360,
+        max_expansions: int = 260,
+        danger_sources: Optional[List[Tuple[float, float, float, float, float]]] = None,
     ) -> List[Vec2]:
-        """Compute an A* path from start to goal on the 8m navgrid, then smooth it."""
+        """Compute an A* path from start to goal on the navgrid, then smooth it."""
         if not self.world.loaded:
             return [goal]
 
@@ -51,8 +52,8 @@ class Navigator:
         if (sx, sy) == (tx, ty):
             return [(gx_clamped, gy_clamped)]
 
-        # Fast-path: straight line is walkable and no danger penalty requested
-        if danger_weight <= 0.01 and self.world.line_walkable(start[0], start[1], gx_clamped, gy_clamped):
+        use_danger = danger_weight > 0.01 and (danger_sources is not None or danger_fn is not None)
+        if not use_danger and self.world.line_walkable(start[0], start[1], gx_clamped, gy_clamped):
             return [(gx_clamped, gy_clamped)]
 
         nx = self.world.nav_nx
@@ -66,14 +67,15 @@ class Navigator:
         goal_idx = ty * nx + tx
 
         g_score = {start_idx: 0.0}
+        danger_cache: dict[int, float] = {}
         closed: set[int] = set()
         came_from = {}
-        # Heuristic: octile distance in cell units
         h0 = math.hypot(tx - sx, ty - sy)
         heap: List[Tuple[float, int]] = [(h0, start_idx)]
         best_idx = start_idx
         best_h = h0
         expansions = 0
+        sqrt = math.sqrt
 
         while heap and expansions < max_expansions:
             _, cur = heapq.heappop(heap)
@@ -94,18 +96,36 @@ class Navigator:
                 if nx_c < 0 or nx_c >= nx or ny_c < 0 or ny_c >= ny:
                     continue
                 n_idx = ny_c * nx + nx_c
-                if not walkable[n_idx]:
+                if n_idx in closed or not walkable[n_idx]:
                     continue
-                # Prevent corner-cutting across two blocked orthogonal cells
                 if dx != 0 and dy != 0:
                     if not walkable[cy * nx + nx_c] or not walkable[ny_c * nx + cx]:
                         continue
 
                 extra = 0.0
-                if danger_fn is not None and danger_weight > 0.0:
-                    wx = min_x + (nx_c + 0.5) * cell
-                    wy = min_y + (ny_c + 0.5) * cell
-                    extra = danger_weight * danger_fn(wx, wy)
+                if use_danger:
+                    cached = danger_cache.get(n_idx)
+                    if cached is None:
+                        wx = min_x + (nx_c + 0.5) * cell
+                        wy = min_y + (ny_c + 0.5) * cell
+                        if danger_sources is not None:
+                            dval = 0.0
+                            for sx_p, sy_p, rad, r_sq, w_p in danger_sources:
+                                ddx = sx_p - wx
+                                if ddx > rad or ddx < -rad:
+                                    continue
+                                ddy = sy_p - wy
+                                if ddy > rad or ddy < -rad:
+                                    continue
+                                d2 = ddx * ddx + ddy * ddy
+                                if d2 < r_sq:
+                                    prox = (rad - sqrt(d2)) / rad
+                                    dval += w_p * prox * prox
+                            cached = danger_weight * dval
+                        else:
+                            cached = danger_weight * danger_fn(wx, wy)
+                        danger_cache[n_idx] = cached
+                    extra = cached
 
                 tentative_g = cur_g + step_cost + extra
                 prev_g = g_score.get(n_idx)
@@ -116,7 +136,6 @@ class Navigator:
                     if h < best_h:
                         best_h = h
                         best_idx = n_idx
-                    # Weighted A* (1.3x heuristic) keeps expansions tiny (<2ms in 1-CPU Docker)
                     heapq.heappush(heap, (tentative_g + h * 1.3, n_idx))
 
         # Reconstruct path
@@ -172,6 +191,7 @@ class Navigator:
         want_boost: bool = False,
         dodge_vec: Optional[Vec2] = None,
         suppress_stuck: bool = False,
+        danger_sources: Optional[List[Tuple[float, float, float, float, float]]] = None,
     ) -> Tuple[List[float], bool, bool, Vec2]:
         """Return (move_xy, boost, jump, active_waypoint)."""
         x, y, z = pos
@@ -209,6 +229,7 @@ class Navigator:
                 goal,
                 danger_fn=danger_fn,
                 danger_weight=danger_weight,
+                danger_sources=danger_sources,
             )
             self.last_goal = goal
             self.last_plan_tick = tick

@@ -27,19 +27,25 @@ def solve_lead_point(
     target_pos: Vec3,
     target_vel: Vec3,
     proj_speed: float,
-    max_lead_s: float = 1.2,
+    max_lead_s: float = 1.1,
+    gravity: float = 22.0,
 ) -> Vec3:
-    """Iterative 3D projectile intercept point."""
+    """Iterative 3D projectile intercept point with gravity correction for jumping/falling targets."""
     tx, ty, tz = target_pos
     vx, vy, vz = target_vel
+    airborne = abs(vz) > 0.6
     t = 0.0
     for _ in range(3):
         px = tx + vx * t
         py = ty + vy * t
-        pz = tz + vz * t
+        pz = tz + vz * t - (0.5 * gravity * t * t if airborne else 0.0)
         dist = math.dist(muzzle, (px, py, pz))
         t = min(max_lead_s, dist / max(1.0, proj_speed))
-    return (tx + vx * t, ty + vy * t, tz + vz * t)
+    return (
+        tx + vx * t,
+        ty + vy * t,
+        tz + vz * t - (0.5 * gravity * t * t if airborne else 0.0),
+    )
 
 
 def solve_mortar_aim(
@@ -126,6 +132,21 @@ class CombatPlanner:
         self.config = config
         self.min_pitch = float(config.get("mech", {}).get("min_pitch", -0.7))
         self.max_pitch = float(config.get("mech", {}).get("max_pitch", 1.3))
+        self._los_cache_tick: int = -1
+        self._los_cache: Dict[int, bool] = {}
+
+    def _cached_los(self, tick: int, target_id: Optional[int], p0: Vec3, p1: Vec3) -> bool:
+        if not self.world.loaded:
+            return True
+        if tick != self._los_cache_tick:
+            self._los_cache_tick = tick
+            self._los_cache.clear()
+        if target_id is not None and target_id in self._los_cache:
+            return self._los_cache[target_id]
+        res = self.world.has_los(p0, p1, step=2.0)
+        if target_id is not None:
+            self._los_cache[target_id] = res
+        return res
 
     def _clamp_pitch(self, pitch: float) -> float:
         return max(self.min_pitch, min(self.max_pitch, pitch))
@@ -147,6 +168,7 @@ class CombatPlanner:
         best: Optional[TrackedEnemy] = None
         best_score = -1e18
 
+        tick = int(obs["tick"])
         for e in threats.visible_enemies():
             t_center = (e.pos[0], e.pos[1], e.pos[2] + 4.5)
             dist = math.dist(muzzle, t_center)
@@ -155,9 +177,13 @@ class CombatPlanner:
             if dist > 265.0:
                 continue
 
-            has_los = self.world.has_los(muzzle, t_center, step=2.0) if self.world.loaded else True
+            has_los = self._cached_los(tick, e.id, muzzle, t_center)
             has_mortar = "mortar" in my_weapons
             if not has_los and not (has_mortar and 18.0 <= dist <= 220.0):
+                continue
+
+            # Avoid broadcasting noisy long-range gun shots at full-HP non-attackers unless we have a laser
+            if dist > 165.0 and e.id not in attackers and e.hp > 650.0 and "laser" not in my_weapons:
                 continue
 
             score = 0.0
@@ -171,12 +197,15 @@ class CombatPlanner:
             score += (1.0 - hp_frac) * 140.0
             if e.hp <= 350.0:
                 score += 90.0
-            # Enemy aiming at us or charging laser
+            # Enemy aiming at us vs turned away from us (rear-armor 1.5x damage!)
             yaw_e_to_me = math.atan2(my - e.pos[1], mx - e.pos[0])
-            if abs(angle_diff(yaw_e_to_me, e.aim[0])) < 0.35:
+            e_facing_err = abs(angle_diff(yaw_e_to_me, e.aim[0]))
+            if e_facing_err < 0.35:
                 score += 65.0
                 if e.charging:
                     score += 80.0
+            elif e_facing_err > math.pi * 0.5:
+                score += 75.0  # Exposed rear armor -> 1.5x damage!
             # Weapon triangle bonuses
             if "laser" in my_weapons and "mortar" in e.weapons:
                 score += 60.0  # +60% cookoff!
@@ -231,7 +260,7 @@ class CombatPlanner:
         energy = float(me["energy"])
         weapons = me["weapons"]
         dist = math.dist(muzzle, target_pos)
-        has_los = self.world.has_los(muzzle, target_pos, step=2.0) if self.world.loaded else True
+        has_los = self._cached_los(int(obs["tick"]), target_id, muzzle, target_pos)
 
         fire = [False, False]
         chosen_aim: Optional[Tuple[float, float]] = None

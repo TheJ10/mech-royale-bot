@@ -377,7 +377,20 @@ class StrategyController:
 
         elif loot_obj is not None:
             self.mode = f"LOOT_{loot_obj.kind.upper()}"
-            goal = (loot_obj.pos[0], loot_obj.pos[1])
+            lx, ly = loot_obj.pos[0], loot_obj.pos[1]
+            # Gentle strafe inside supply-drop 8m ring while capturing, or around NPC drones to dodge 90m/s bullets
+            if loot_obj.kind == "drop" and math.hypot(lx - x, ly - y) < 6.0:
+                ang = now * 1.8
+                goal = (lx + math.cos(ang) * 3.5, ly + math.sin(ang) * 3.5)
+            elif loot_obj.kind == "npc" and not self.profile.pacifist:
+                dx_n, dy_n = lx - x, ly - y
+                dn = max(1.0, math.hypot(dx_n, dy_n))
+                goal = self.world.clamp_to_bounds(
+                    lx - (dy_n / dn) * 10.0 * self._strafe_dir,
+                    ly + (dx_n / dn) * 10.0 * self._strafe_dir,
+                )
+            else:
+                goal = (lx, ly)
             want_boost = False
             if loot_obj.kind in ("crate", "npc") and not self.profile.pacifist:
                 z_off = 1.2 if loot_obj.kind == "crate" else 1.8
@@ -404,7 +417,7 @@ class StrategyController:
         suppress_stuck = charging_laser or self.mode == "COMBAT_KITE" or (
             self.profile.silent_when_hidden and self.mode == "SAFE_ROTATE"
         )
-        danger_fn = lambda wx, wy: self.threats.danger_at(wx, wy, now)
+        danger_sources = self.threats.snapshot_sources(now)
         move_xy, boost, jump, _ = self.nav.update_and_steer(
             tick=tick,
             pos=pos3,
@@ -412,11 +425,11 @@ class StrategyController:
             grounded=grounded,
             energy=energy,
             goal=goal,
-            danger_fn=danger_fn,
             danger_weight=danger_weight,
             want_boost=want_boost,
             dodge_vec=dodge_vec,
             suppress_stuck=suppress_stuck,
+            danger_sources=danger_sources,
         )
 
         # Silent walking for pacifist when already safe & hidden

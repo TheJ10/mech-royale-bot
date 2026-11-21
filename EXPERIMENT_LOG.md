@@ -6,7 +6,8 @@
 | --- | --- | --- | ---: | --- |
 | Official starter | `main` / `baseline/official-starter` | `14a4d1ef8a8dd0d8d37170b74f4feb95bb554991` | **1.15** | Untouched official Python starter (current best official score) |
 | Defensive survival v1 | `baseline/survival-v1` | `eaca8b212e83f6986fb404efc6d26e6f385b3c1c` | **0.85** | Teammate's survival prototype (underperformed starter) |
-| Tactical Survivor v2 (Iter 1) | `experiment/tactical-survivor-v2` | *See latest commit on branch* | *Pending manual submission* | Full modular map/nav/threat/combat/resource stack + 10 bug-hunter fixes |
+| Tactical Survivor v2 (Iter 1) | `experiment/tactical-survivor-v2` | `890088ef5677488d495fbb8cd6f1caa9e5a6a61e` | *Pending manual submission* | Modular map/nav/threat/combat/resource stack + 10 bug-hunter fixes (Docker P99 31.0 ms, 0 late) |
+| Tactical Survivor v2 (Iter 2) | `experiment/tactical-survivor-v2` | *Latest commit on branch* | *Pending manual submission* | 7 m slope-aware navgrid, inline cached A* danger, gravity-corrected lead, rear-armor offense, supply-drop capture holding (Docker P99 32.2 ms, 0 late) |
 
 ---
 
@@ -41,3 +42,25 @@ An independent read-only `bug-hunter` audit caught 10 confirmed defects (1 Criti
 - **Docker `linux/amd64` build:** `PASS` (exit `0`, build context `203.00 kB`).
 - **Docker sandbox check (`1 CPU`, `512 MB`, `--network none`, `--read-only`, `--tmpfs /tmp:rw,size=64m`, `--user 65534:65534`, `/arena:ro`):**
   - `PASS` — `ready in 5926 ms`, `300/300` on time, `0` late, `p50 5.0 ms`, `p90 12.5 ms`, `p99 31.0 ms`, `max 36.8 ms`, `0` wrong tick, `0` bad lines, `300` debug drawings (`0` over caps).
+
+---
+
+## Iteration 2 — Finer Slope-Aware Navgrid, Cached A* Danger, Gravity Lead & Supply-Drop Holding (`experiment/tactical-survivor-v2`)
+
+### Hypothesis
+Profiling Iteration 1 against `arena/v2` and `check/stream.jsonl.gz` revealed:
+1. 135 walkable cells on the 8 m grid had steep slopes (>48°, up to 85.4°) that violate `max_slope_deg = 50°` and risk trapping the mech.
+2. 63% of CPU time was spent inside `danger_at` calls during A* expansions; moving to a pre-snapshotted, per-cell cached inline danger calculation frees headroom for a finer `7.0 m` corridor navgrid.
+3. Airborne/jumping targets were over-led vertically without gravity correction, enemies with turned backs (1.5× rear-armor multiplier) were not prioritized, and supply drops lacked 8 m capture-ring holding behavior.
+
+### Changes Implemented
+- `bot/world.py`: Upgraded `NAV_CELL` to `7.0 m`, added fast int16 steep-slope rejection (>48°) in `_build_navgrid`, tracked `max_terrain_z` for faster `has_los`, and bounded cover LoS checks to top 10 candidates.
+- `bot/threat.py` & `bot/nav.py`: Added `ThreatTracker.snapshot_sources(now)` + per-cell `danger_cache` inline in `Navigator.plan_path` (`max_expansions = 260`), eliminating repeated lambda/method overhead.
+- `bot/combat.py`: Added gravity-corrected 3D Z-lead for airborne targets, rear-armor offense targeting bonus (+75 score when enemy's back is turned), noisy long-range gun suppression (>165 m vs full-HP non-attackers), and per-tick `has_los` caching.
+- `bot/resources.py` & `bot/strategy.py`: Expanded safe supply-drop evaluation (110 m, 18 s) with active gentle strafing inside the 8 m capture ring and NPC bullet-dodging strafe while farming drones.
+
+### Verification & Performance Results (Iteration 2)
+- **Unit & scenario tests:** `20/20 PASS` (synthetic/local verification only).
+- **Host conformance check:** `PASS` — `300/300` on time, `0` late, `p50 1.3 ms`, `p90 3.0 ms`, `p99 5.4 ms`, `max 11.4 ms`.
+- **Docker `linux/amd64` build:** `PASS` (exit `0`, build context `77.77 kB`).
+- **Docker sandbox check:** `PASS` — `ready 4809 ms`, `300/300` on time, `0` late, `p50 6.6 ms`, `p90 16.9 ms`, `p99 32.2 ms`, `max 39.8 ms`.

@@ -198,14 +198,17 @@ class ResourcePlanner:
                 if m.get("kind") == "npc":
                     consider("npc", tuple(m["pos"]), int(m["id"]), 68.0, min(50.0, max_detour))
 
-        # 5. Supply drops (3 cubes + full heal! Only if close, landing soon, and low threat)
-        if hp_frac >= 0.65:
+        # 5. Supply drops (3 cubes + full heal + full energy! Hold ring if close & low threat)
+        if hp_frac >= 0.55:
             for dr in obs.get("drops") or []:
                 lands_in = float(dr.get("lands_in", 99.0))
-                if lands_in > 14.0:
+                if lands_in > 18.0:
                     continue
                 dpos = tuple(dr["pos"])
-                if math.hypot(dpos[0] - x, dpos[1] - y) <= 85.0:
-                    consider("drop", dpos, int(dr["id"]), 110.0, 85.0)
+                d_drop = math.hypot(dpos[0] - x, dpos[1] - y)
+                if d_drop <= 110.0:
+                    # Extra value if already inside/near the capture ring or actively holding it
+                    bonus = 155.0 if (d_drop <= 12.0 or dr.get("holder") == me["id"]) else 115.0
+                    consider("drop", dpos, int(dr["id"]), bonus, 110.0)
 
         return best

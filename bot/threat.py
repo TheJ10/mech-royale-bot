@@ -193,6 +193,25 @@ class ThreatTracker:
     def recent_attackers(self, now: float, window: float = 5.0) -> set[int]:
         return {eid for eid, t in self.last_hit_by.items() if now - t <= window}
 
+    def snapshot_sources(self, now: float) -> List[Tuple[float, float, float, float, float]]:
+        """Compact list of (x, y, radius, r_sq, weight) for ultra-fast inline A* danger evaluation."""
+        sources: List[Tuple[float, float, float, float, float]] = []
+        for e in self.enemies.values():
+            age = max(0.0, now - e.last_seen_t)
+            decay = 1.0 if e.visible_now else max(0.15, 1.0 - age / self.MEMORY_TTL)
+            mult = 1.0 + 0.05 * min(e.cubes, 10)
+            if e.charging:
+                mult *= 1.4
+            sources.append((e.pos[0], e.pos[1], 160.0, 25600.0, decay * mult * 6.0))
+            if "lightning" in e.weapons:
+                sources.append((e.pos[0], e.pos[1], 55.0, 3025.0, decay * 4.5))
+        for s in self.sounds:
+            age = max(0.0, now - s.t)
+            decay = max(0.0, 1.0 - age / self.SOUND_TTL)
+            if decay > 0.05:
+                sources.append((s.x, s.y, 120.0, 14400.0, decay * s.weight * 1.2))
+        return sources
+
     def danger_at(self, x: float, y: float, now: float) -> float:
         """Non-negative threat penalty for A* routing and safe-position scoring."""
         score = 0.0

@@ -139,7 +139,7 @@ class WorldModel:
     """Static arena model with O(1) terrain lookup, spatial-hashed prisms, 3D LoS, and 2D navgrid."""
 
     HASH_CELL = 32.0
-    NAV_CELL = 8.0
+    NAV_CELL = 7.0
 
     def __init__(self, map_dir: Optional[str] = None, mech_radius: float = 2.5, mech_height: float = 9.0, step_up: float = 1.2):
         self.mech_radius = mech_radius
@@ -161,6 +161,7 @@ class WorldModel:
         self.t_ny = 0
         self.t_scale = 0.01
         self.terrain: Optional[array.array] = None
+        self.max_terrain_z: float = 100.0
 
         # Prisms and spatial hash
         self.prisms: List[Prism] = []
@@ -206,6 +207,7 @@ class WorldModel:
                 arr.frombytes(tf.read())
             if len(arr) >= self.t_nx * self.t_ny:
                 self.terrain = arr
+                self.max_terrain_z = max(arr) * self.t_scale
 
         self.prisms = []
         self._hash = {}
@@ -345,13 +347,34 @@ class WorldModel:
         cover_adj = bytearray(total)
 
         half = cell * 0.5
+        # tan(48 deg) ~= 1.1106 -> 3.33m over 3m = 333 int16 cm
+        max_slope_cm = 333
+        t_arr = self.terrain
+        t_nx = self.t_nx
+        t_ny = self.t_ny
+        t_min_x = self.t_min_x
+        t_min_y = self.t_min_y
         for gy in range(self.nav_ny):
             cy = self.nav_min_y + gy * cell + half
             row = gy * self.nav_nx
+            tj = int(cy - t_min_y) if t_arr is not None else 0
             for gx in range(self.nav_nx):
                 cx = self.nav_min_x + gx * cell + half
-                if not self.is_blocked_at(cx, cy, clearance=0.5):
-                    walkable[row + gx] = 1
+                if self.is_blocked_at(cx, cy, clearance=0.5):
+                    continue
+                if t_arr is not None and 3 <= tj < t_ny - 3:
+                    ti = int(cx - t_min_x)
+                    if 3 <= ti < t_nx - 3:
+                        idx0 = tj * t_nx + ti
+                        h0 = t_arr[idx0]
+                        if (
+                            abs(t_arr[idx0 + 3] - h0) > max_slope_cm
+                            or abs(t_arr[idx0 - 3] - h0) > max_slope_cm
+                            or abs(t_arr[idx0 + 3 * t_nx] - h0) > max_slope_cm
+                            or abs(t_arr[idx0 - 3 * t_nx] - h0) > max_slope_cm
+                        ):
+                            continue
+                walkable[row + gx] = 1
 
         # Mark cells adjacent to solid obstacles (good cover positions)
         for gy in range(1, self.nav_ny - 1):
@@ -462,12 +485,14 @@ class WorldModel:
                     return False
 
         # March interior points along segment
+        check_terrain = self.terrain is not None
+        max_tz = self.max_terrain_z + 0.5
         for k in range(1, steps):
             t = k * inv
             px = x0 + dx * t
             py = y0 + dy * t
             pz = z0 + dz * t
-            if self.terrain is not None:
+            if check_terrain and pz < max_tz and (k & 1 == 1):
                 if pz < self.terrain_height(px, py) - 0.3:
                     return False
             for p in cand_prisms:
@@ -534,7 +559,7 @@ class WorldModel:
         if not candidates:
             return None
         candidates.sort(key=lambda c: c[0], reverse=True)
-        for score, wx, wy in candidates[:14]:
+        for score, wx, wy in candidates[:10]:
             wz = self.terrain_height(wx, wy)
             if not self.has_los(t_eye, (wx, wy, wz + 5.0), step=3.5):
                 return (wx, wy)
