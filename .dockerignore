@@ -9,8 +9,8 @@ __pycache__/
 antigravity-prompts.txt
 arena/
 check/
-README.md
-protocol.md
+tests/
+*.md
 mechfight.schema.json
 .env
 .env.*
