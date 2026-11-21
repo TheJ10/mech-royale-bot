@@ -16,7 +16,7 @@ class TestOpportunisticHunter(unittest.TestCase):
     def test_profile_is_opportunistic_hunter(self):
         self.assertEqual(self.bot.profile.name, "opportunistic_hunter")
         self.assertFalse(self.bot.profile.pacifist)
-        self.assertEqual(self.bot.name, "hunter-v1")
+        self.assertEqual(self.bot.name, "hunter-v2")
 
     def test_engages_vulnerable_wounded_enemy_and_fires(self):
         wounded = {

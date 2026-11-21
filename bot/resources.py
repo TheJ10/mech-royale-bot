@@ -192,23 +192,25 @@ class ResourcePlanner:
             for cr in obs.get("crates") or []:
                 consider("crate", tuple(cr["pos"]), int(cr["id"]), 62.0, min(48.0, max_detour))
 
-        # 4. NPC drones (350 HP -> 2 cubes! Only when healthy and no nearby enemy mechs)
-        if not self.pacifist and hp_frac >= 0.72 and not threats.visible_enemies():
+        # 4. NPC drones (350 HP -> 2 cubes! Only when very healthy and completely quiet)
+        if not self.pacifist and hp_frac >= 0.80 and not threats.visible_enemies() and threats.danger_at(x, y, now) < 1.0:
             for m in obs.get("mechs") or []:
                 if m.get("kind") == "npc":
-                    consider("npc", tuple(m["pos"]), int(m["id"]), 68.0, min(50.0, max_detour))
+                    consider("npc", tuple(m["pos"]), int(m["id"]), 64.0, min(46.0, max_detour))
 
-        # 5. Supply drops (3 cubes + full heal + full energy! Hold ring if close & low threat)
+        # 5. Supply drops (3 cubes + full heal + full energy! Skip contested/high-danger drops)
         if hp_frac >= 0.55:
             for dr in obs.get("drops") or []:
                 lands_in = float(dr.get("lands_in", 99.0))
-                if lands_in > 18.0:
+                if lands_in > 14.0:
+                    continue
+                holder = dr.get("holder")
+                if holder is not None and holder != me["id"]:
                     continue
                 dpos = tuple(dr["pos"])
                 d_drop = math.hypot(dpos[0] - x, dpos[1] - y)
-                if d_drop <= 110.0:
-                    # Extra value if already inside/near the capture ring or actively holding it
-                    bonus = 155.0 if (d_drop <= 12.0 or dr.get("holder") == me["id"]) else 115.0
-                    consider("drop", dpos, int(dr["id"]), bonus, 110.0)
+                if d_drop <= 85.0 and threats.danger_at(dpos[0], dpos[1], now) < 1.6:
+                    bonus = 155.0 if (d_drop <= 12.0 or holder == me["id"]) else 110.0
+                    consider("drop", dpos, int(dr["id"]), bonus, 85.0)
 
         return best
