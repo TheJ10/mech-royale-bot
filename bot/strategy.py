@@ -59,7 +59,7 @@ PROFILES: Dict[str, StrategyProfile] = {
     ),
     "opportunistic_hunter": StrategyProfile(
         name="opportunistic_hunter",
-        bot_name="hunter-v2",
+        bot_name="hunter-v2.1",
         pacifist=False,
         selective_engage=False,
         hold_silent_at_cover=False,
@@ -208,16 +208,22 @@ class StrategyController:
         walk_s = dist_to_next_safe / walk_speed
         sec_until_shrink = shrink_start - now
 
-        # In final phase (next_radius <= 10), allow normal combat/kiting while inside active circle
+        # BH-006 + BH-103: Final-zone boundary clamping with proportional margin & active_center pairing
         if next_radius <= 10.0:
-            zone_urgent = (not in_zone) or (dist_to_active_edge < 10.0 and active_r > 12.0)
+            edge_margin = min(10.0, active_r * 0.35)
+            zone_urgent = (not in_zone) or (active_r > 3.5 and dist_to_active_edge < edge_margin)
         else:
             zone_urgent = (not in_zone) or (dist_to_next_safe > 0.0 and sec_until_shrink <= walk_s + 12.0)
 
-        # Use active circle for loot/cover/kiting when plenty of time remains before shrink
-        play_center = active_center if sec_until_shrink > walk_s + 15.0 else next_center
-        play_radius = active_r if sec_until_shrink > walk_s + 15.0 else max(next_radius, active_r if next_radius <= 10.0 else next_radius)
+        use_active_circle = (sec_until_shrink > walk_s + 15.0) or (next_radius <= 10.0)
+        play_center = active_center if use_active_circle else next_center
+        play_radius = active_r if use_active_circle else next_radius
+        safe_play_r = max(0.0, play_radius - min(10.0, play_radius * 0.30))
         laser_shorted = now < self.threats.laser_short_until_t
+        charging_laser = any(w and w["kind"] == "laser" and float(w.get("charge", 0.0)) > 0.0 for w in me["weapons"])
+        laser_ready = (not laser_shorted) and any(
+            w and w["kind"] == "laser" and float(w.get("cooldown", 0.0)) <= 0.05 for w in me["weapons"]
+        )
 
         vis_enemies = self.threats.visible_enemies()
         nearest_enemy: Optional[TrackedEnemy] = None
@@ -357,10 +363,11 @@ class StrategyController:
                 allow_fire=True,
                 laser_shorted=laser_shorted,
             )
-            # Check if primary weapon is reloading/on-cooldown -> duck behind cover while reloading!
+            # BH-005: Reload-in-cover preserves active/ready laser charge & clamps fallback inside safe_play_r
             gun_reloading = any(w and w["kind"] == "gun" and float(w.get("reload", 0.0)) > 0.35 for w in me["weapons"])
             can_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"]) and math.hypot(mech_target.pos[0] - x, mech_target.pos[1] - y) < 43.0
-            if gun_reloading and not can_lightning and self.world.loaded:
+            laser_active = charging_laser or (laser_ready and combat_plan.weapon_kind == "laser")
+            if gun_reloading and not can_lightning and not laser_active and self.world.loaded:
                 if self._cover_pt is None or (now - self._cover_t) > 1.2:
                     self._cover_pt = self.world.find_cover_point(pos3, mech_target.pos, play_center, play_radius, search_radius=36.0)
                     self._cover_t = now
@@ -368,7 +375,16 @@ class StrategyController:
                     goal = self._cover_pt
                     want_boost = dodge_vec is not None and energy > 25.0
                 else:
-                    goal = self.world.clamp_to_bounds(x - (mech_target.pos[0] - x) * 0.3, y - (mech_target.pos[1] - y) * 0.3)
+                    away_dx = x - mech_target.pos[0]
+                    away_dy = y - mech_target.pos[1]
+                    away_n = max(1.0, math.hypot(away_dx, away_dy))
+                    step_d = min(18.0, max(4.0, safe_play_r))
+                    fx = x + (away_dx / away_n) * step_d
+                    fy = y + (away_dy / away_n) * step_d
+                    if math.hypot(fx - play_center[0], fy - play_center[1]) > safe_play_r:
+                        fx, fy = play_center
+                    goal = self.world.clamp_to_bounds(fx, fy)
+                    want_boost = dodge_vec is not None and energy > 25.0
             else:
                 # Flip strafe direction every ~1.4s so enemy lead misses
                 if now - self._last_strafe_flip_t > 1.4:
@@ -401,10 +417,11 @@ class StrategyController:
                 elif d < desired_r - 10.0:
                     radial = -0.65
 
-                gx = x + (px * 0.85 + ux * radial) * 24.0
-                gy = y + (py * 0.85 + uy * radial) * 24.0
-                if math.hypot(gx - play_center[0], gy - play_center[1]) > max(8.0, play_radius - 10.0):
-                    gx, gy = next_center
+                step_k = min(24.0, max(4.0, safe_play_r))
+                gx = x + (px * 0.85 + ux * radial) * step_k
+                gy = y + (py * 0.85 + uy * radial) * step_k
+                if math.hypot(gx - play_center[0], gy - play_center[1]) > safe_play_r:
+                    gx, gy = play_center
                 goal = self.world.clamp_to_bounds(gx, gy)
                 want_boost = dodge_vec is not None and energy > 25.0
 

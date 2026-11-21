@@ -546,7 +546,8 @@ class WorldModel:
         gx0, gy0 = self.world_to_grid(mx, my)
         r_cells = max(2, int(search_radius / self.NAV_CELL))
         zcx, zcy = zone_center
-        safe_r2 = max(10.0, zone_radius - 6.0) ** 2
+        margin = min(6.0, zone_radius * 0.25)
+        safe_r2 = max(0.0, zone_radius - margin) ** 2
 
         # Collect candidate cover cells first using cheap 2D geometry, then test LoS on top 16 only
         candidates: List[Tuple[float, float, float]] = []

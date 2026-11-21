@@ -54,7 +54,7 @@ class Navigator:
         if (sx, sy) == (tx, ty):
             return [(gx_clamped, gy_clamped)]
 
-        use_danger = danger_weight > 0.01 and (danger_sources is not None or danger_fn is not None)
+        use_danger = danger_weight > 0.01 and (bool(danger_sources) or danger_fn is not None)
         if not use_danger and self.world.line_walkable(start[0], start[1], gx_clamped, gy_clamped):
             return [(gx_clamped, gy_clamped)]
 
@@ -221,24 +221,30 @@ class Navigator:
                     if energy >= 35.0:
                         self.unstuck_jet_until_tick = tick + 8
 
-        # Replan A* when needed (throttle stuck-triggered replans to >= 6 ticks)
-        need_replan = (
-            not self.path
-            or self.last_goal is None
-            or math.hypot(goal[0] - self.last_goal[0], goal[1] - self.last_goal[1]) > 16.0
-            or (tick - self.last_plan_tick) >= 24
-            or (is_stuck and (tick - self.last_plan_tick) >= 6)
-        )
-        if need_replan and dist_to_goal > 5.0:
-            self.path = self.plan_path(
-                (x, y),
-                goal,
-                danger_fn=danger_fn,
-                danger_weight=danger_weight,
-                danger_sources=danger_sources,
-            )
+        # BH-004 + BH-101: Clear stale distant path when goal is within 5m and reset replan tick
+        if dist_to_goal <= 5.0:
+            self.path = [goal]
             self.last_goal = goal
-            self.last_plan_tick = tick
+            self.last_plan_tick = -100
+        else:
+            # Replan A* when needed (throttle stuck-triggered replans to >= 6 ticks)
+            need_replan = (
+                not self.path
+                or self.last_goal is None
+                or math.hypot(goal[0] - self.last_goal[0], goal[1] - self.last_goal[1]) > 16.0
+                or (tick - self.last_plan_tick) >= 24
+                or (is_stuck and (tick - self.last_plan_tick) >= 6)
+            )
+            if need_replan:
+                self.path = self.plan_path(
+                    (x, y),
+                    goal,
+                    danger_fn=danger_fn,
+                    danger_weight=danger_weight,
+                    danger_sources=danger_sources,
+                )
+                self.last_goal = goal
+                self.last_plan_tick = tick
 
         # Advance waypoints already reached
         while len(self.path) > 1 and math.hypot(self.path[0][0] - x, self.path[0][1] - y) < 7.0:
