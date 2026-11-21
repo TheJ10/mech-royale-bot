@@ -29,13 +29,13 @@ class StrategyProfile:
 PROFILES: Dict[str, StrategyProfile] = {
     "tactical_survivor": StrategyProfile(
         name="tactical_survivor",
-        bot_name="tactical-surv-v2",
+        bot_name="tactical-v2-patrol",
         pacifist=False,
         retreat_hp_frac=0.45,
         outnumbered_hp_frac=0.72,
         engage_range=135.0,
         danger_nav_weight=2.2,
-        loot_detour_m=55.0,
+        loot_detour_m=75.0,
         quiet_ring_frac=0.62,
         silent_when_hidden=False,
     ),
@@ -87,6 +87,8 @@ class StrategyController:
         self.mode: str = "SAFE_ROTATE"
         self._anchor: Optional[Vec2] = None
         self._anchor_t: float = -100.0
+        self._at_anchor_since_t: Optional[float] = None
+        self._patrol_phase: int = 0
         self._cover_pt: Optional[Vec2] = None
         self._cover_t: float = -100.0
         self._strafe_dir: float = 1.0
@@ -104,8 +106,30 @@ class StrategyController:
         mx, my, _ = me["pos"]
         zcx, zcy = zone_center
 
-        # Keep existing anchor for 3.5s if still safely inside next_radius and low threat
-        if self._anchor is not None and (now - self._anchor_t) < 3.5:
+        # Keep existing anchor for 3.5s if still safely inside next_radius and low threat,
+        # unless healthy with <8 cubes and already parked at this anchor for >3.0s (advance patrol sector!)
+        want_patrol_advance = False
+        hp_frac = float(me["hp"]) / max(1.0, float(me["max_hp"]))
+        cubes = int(me.get("cubes", 0))
+        if self._anchor is not None:
+            ax, ay = self._anchor
+            if math.hypot(ax - mx, ay - my) < 9.0:
+                if self._at_anchor_since_t is None:
+                    self._at_anchor_since_t = now
+                elif (
+                    (now - self._at_anchor_since_t) >= 3.0
+                    and hp_frac >= 0.65
+                    and cubes < 8
+                    and next_radius > 55.0
+                    and bool(me["in_zone"])
+                ):
+                    want_patrol_advance = True
+                    self._patrol_phase += 1
+                    self._at_anchor_since_t = None
+            else:
+                self._at_anchor_since_t = None
+
+        if not want_patrol_advance and self._anchor is not None and (now - self._anchor_t) < 6.0:
             ax, ay = self._anchor
             if math.hypot(ax - zcx, ay - zcy) <= max(5.0, next_radius - 8.0):
                 if self.threats.danger_at(ax, ay, now) < 3.0:
@@ -140,7 +164,12 @@ class StrategyController:
                 danger = self.threats.danger_at(wx, wy, now)
                 dist_me = math.hypot(wx - mx, wy - my)
                 has_cover = bool(self.world.loaded and self.world.cover_adj[gy * self.world.nav_nx + gx])
-                score = (28.0 if has_cover else 0.0) - danger * 24.0 - dist_me * 0.14
+                if want_patrol_advance:
+                    # Prefer a fresh quiet cover sector 65..170m away to sweep new crates/cubes/weapons
+                    patrol_bonus = 35.0 if 60.0 <= dist_me <= 170.0 else (-30.0 if dist_me < 45.0 else 0.0)
+                    score = (28.0 if has_cover else 0.0) + patrol_bonus - danger * 26.0 - dist_me * 0.06
+                else:
+                    score = (28.0 if has_cover else 0.0) - danger * 24.0 - dist_me * 0.14
                 if score > best_score:
                     best_score = score
                     best_pt = (wx, wy)
