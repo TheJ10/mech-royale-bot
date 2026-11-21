@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+
+# Local archives and prompt notes
+*.tar.gz
+*.zip
+antigravity-prompts.txt
+
+# Logs and OS files
+*.log
+.DS_Store
+Thumbs.db
+
+# Secrets and local env
+.env
+.env.*
+*.pem
+*.key

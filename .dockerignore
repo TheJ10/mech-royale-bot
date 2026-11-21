@@ -1,0 +1,16 @@
+.git
+.gitignore
+.dockerignore
+.gitattributes
+__pycache__/
+*.py[cod]
+*.tar.gz
+*.zip
+antigravity-prompts.txt
+arena/
+check/
+README.md
+protocol.md
+mechfight.schema.json
+.env
+.env.*
