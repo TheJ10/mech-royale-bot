@@ -347,6 +347,25 @@ class TestScenarios(unittest.TestCase):
         self.bot.act(obs)
         self.assertEqual(self.bot.strategy.mode, "COMBAT_KITE")
 
+    def test_13_selective_engage_skips_noisy_midrange_full_hp_duel(self):
+        bot = MechBot(make_hello())
+        # Healthy enemy at 110m facing perpendicular (not aiming at us, not wounded, alive=12)
+        enemy = {"id": 11, "kind": "mech", "pos": [110.0, 0.0, 0.0], "vel": [0, 0, 0], "aim": [1.57, 0.0], "hp": 1400.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"]}
+        obs = make_obs(pos=[0.0, 0.0, 0.0], mechs=[enemy])
+        act = bot.act(obs)
+        self.assertNotEqual(bot.strategy.mode, "COMBAT_KITE")
+        self.assertEqual(act["fire"], [False, False])
+
+    def test_14_rooftop_hold_when_safe_in_zone(self):
+        obs = make_obs(pos=[0.0, 0.0, 18.0], grounded=True, in_zone=True)
+        act = self.bot.act(obs)
+        self.assertEqual(self.bot.strategy.mode, "ROOF_HOLD")
+        self.assertEqual(act["move"], [0.0, 0.0])
+
+    def test_15_escape_degree_populated_on_real_arena(self):
+        self.assertEqual(len(self.bot.world.escape_deg), len(self.bot.world.walkable))
+        self.assertGreater(max(self.bot.world.escape_deg), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

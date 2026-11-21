@@ -174,6 +174,7 @@ class WorldModel:
         self.nav_min_y = self.min_y
         self.walkable: bytearray = bytearray()
         self.cover_adj: bytearray = bytearray()
+        self.escape_deg: bytearray = bytearray()
 
         if map_dir:
             self.load(map_dir)
@@ -345,6 +346,7 @@ class WorldModel:
         total = self.nav_nx * self.nav_ny
         walkable = bytearray(total)
         cover_adj = bytearray(total)
+        escape_deg = bytearray(total)
 
         half = cell * 0.5
         # tan(48 deg) ~= 1.1106 -> 3.33m over 3m = 333 int16 cm
@@ -376,22 +378,36 @@ class WorldModel:
                             continue
                 walkable[row + gx] = 1
 
-        # Mark cells adjacent to solid obstacles (good cover positions)
+        # Mark cells adjacent to solid obstacles and compute 8-neighbor escape degree (dead-end detection)
+        nx = self.nav_nx
         for gy in range(1, self.nav_ny - 1):
-            row = gy * self.nav_nx
-            for gx in range(1, self.nav_nx - 1):
-                if not walkable[row + gx]:
+            row = gy * nx
+            for gx in range(1, nx - 1):
+                idx = row + gx
+                if not walkable[idx]:
                     continue
+                deg = (
+                    walkable[idx - 1]
+                    + walkable[idx + 1]
+                    + walkable[idx - nx]
+                    + walkable[idx + nx]
+                    + walkable[idx - nx - 1]
+                    + walkable[idx - nx + 1]
+                    + walkable[idx + nx - 1]
+                    + walkable[idx + nx + 1]
+                )
+                escape_deg[idx] = deg
                 if (
-                    not walkable[row + gx - 1]
-                    or not walkable[row + gx + 1]
-                    or not walkable[row - self.nav_nx + gx]
-                    or not walkable[row + self.nav_nx + gx]
+                    not walkable[idx - 1]
+                    or not walkable[idx + 1]
+                    or not walkable[idx - nx]
+                    or not walkable[idx + nx]
                 ):
-                    cover_adj[row + gx] = 1
+                    cover_adj[idx] = 1
 
         self.walkable = walkable
         self.cover_adj = cover_adj
+        self.escape_deg = escape_deg
 
     def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
         gx = int((x - self.nav_min_x) / self.NAV_CELL)
@@ -553,7 +569,10 @@ class WorldModel:
                 if d_me < 6.0 or d_me > search_radius:
                     continue
                 d_threat = math.hypot(wx - tx, wy - ty)
-                score = d_threat * 0.8 - d_me * 1.4
+                deg = self.escape_deg[row + gx]
+                # Prefer building corners (deg 4..6) and strongly penalize dead ends (deg <= 2)
+                corner_bonus = 12.0 if 4 <= deg <= 6 else (-25.0 if deg <= 2 else 0.0)
+                score = d_threat * 0.85 - d_me * 1.35 + corner_bonus
                 candidates.append((score, wx, wy))
 
         if not candidates:
