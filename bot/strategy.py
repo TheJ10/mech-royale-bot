@@ -216,9 +216,10 @@ class StrategyController:
         else:
             zone_urgent = (not in_zone) or (dist_to_next_safe > 0.0 and sec_until_shrink <= walk_s + 12.0)
 
-        # Use active circle for loot/cover/kiting when plenty of time remains before shrink
-        play_center = active_center if sec_until_shrink > walk_s + 15.0 else next_center
-        play_radius = active_r if sec_until_shrink > walk_s + 15.0 else max(next_radius, active_r if next_radius <= 10.0 else next_radius)
+        # Use active circle for loot/cover/kiting when plenty of time remains before shrink OR in final shrink (BH-103)
+        use_active_circle = (sec_until_shrink > walk_s + 15.0) or (next_radius <= 10.0)
+        play_center = active_center if use_active_circle else next_center
+        play_radius = active_r if use_active_circle else next_radius
         # Strict safe play radius (never exceeds play_radius when final circle is tiny!)
         safe_play_r = max(0.0, play_radius - min(10.0, play_radius * 0.30))
         laser_shorted = now < self.threats.laser_short_until_t
@@ -548,8 +549,8 @@ class StrategyController:
             aim = combat_plan.aim
         elif self.threats.rear_alert_bearing is not None:
             aim = [self.threats.rear_alert_bearing, 0.0]
-        elif nearest_enemy is not None and nearest_dist < 160.0:
-            # Maintain front-arc facing toward visible threat even when choosing to hold fire!
+        elif nearest_enemy is not None and (nearest_dist < 160.0 or (nearest_enemy.charging and nearest_dist < 260.0)):
+            # Maintain front-arc facing toward visible threat (and long-range charging lasers!) even when holding fire!
             aim = [math.atan2(nearest_enemy.pos[1] - y, nearest_enemy.pos[0] - x), 0.0]
         else:
             # Smooth torso scan around movement heading so 120° FOV sweeps 360°

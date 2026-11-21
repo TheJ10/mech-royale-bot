@@ -203,8 +203,14 @@ class CombatPlanner:
                 if not (threatening_me or vulnerable or rear_ambush or cookoff_shot):
                     continue
 
-            # Avoid broadcasting noisy long-range gun shots at full-HP non-attackers unless we have a laser
-            if dist > 165.0 and e.id not in attackers and e.hp > 650.0 and "laser" not in my_weapons:
+            # Avoid broadcasting noisy long-range gun shots at full-HP non-attackers unless we have a laser or they are charging a laser at us (BH-102)
+            if (
+                dist > 165.0
+                and e.id not in attackers
+                and e.hp > 650.0
+                and "laser" not in my_weapons
+                and not (e.charging and e_facing_err < 0.35)
+            ):
                 continue
 
             score = 0.0

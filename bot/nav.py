@@ -229,9 +229,11 @@ class Navigator:
                             self.unstuck_jet_until_tick = tick + 8
 
         # Clear stale distant path when goal is right next to us (e.g., cube pickup or 3.5m drop ring)
+        # Reset last_plan_tick so transitioning from <=5m to a 6..16m goal replans immediately (BH-101)
         if dist_to_goal <= 5.0:
             self.path = [goal]
             self.last_goal = goal
+            self.last_plan_tick = -100
         else:
             # Replan A* when needed (throttle stuck-triggered replans to >= 6 ticks)
             need_replan = (
