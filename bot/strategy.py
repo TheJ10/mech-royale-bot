@@ -17,10 +17,12 @@ class StrategyProfile:
     name: str
     bot_name: str
     pacifist: bool = False
-    retreat_hp_frac: float = 0.45
-    outnumbered_hp_frac: float = 0.72
+    selective_engage: bool = True
+    hold_silent_at_cover: bool = True
+    retreat_hp_frac: float = 0.58
+    outnumbered_hp_frac: float = 0.82
     engage_range: float = 130.0
-    danger_nav_weight: float = 2.0
+    danger_nav_weight: float = 2.4
     loot_detour_m: float = 55.0
     quiet_ring_frac: float = 0.62
     silent_when_hidden: bool = False
@@ -29,38 +31,44 @@ class StrategyProfile:
 PROFILES: Dict[str, StrategyProfile] = {
     "tactical_survivor": StrategyProfile(
         name="tactical_survivor",
-        bot_name="tactical-surv-v2",
+        bot_name="tactical-surv-v3",
         pacifist=False,
-        retreat_hp_frac=0.45,
-        outnumbered_hp_frac=0.72,
+        selective_engage=True,
+        hold_silent_at_cover=True,
+        retreat_hp_frac=0.58,
+        outnumbered_hp_frac=0.82,
         engage_range=135.0,
-        danger_nav_weight=2.2,
+        danger_nav_weight=2.4,
         loot_detour_m=55.0,
         quiet_ring_frac=0.62,
         silent_when_hidden=False,
     ),
     "pure_pacifist": StrategyProfile(
         name="pure_pacifist",
-        bot_name="pacifist-v1",
+        bot_name="pacifist-v2",
         pacifist=True,
+        selective_engage=True,
+        hold_silent_at_cover=True,
         retreat_hp_frac=0.99,
         outnumbered_hp_frac=0.99,
         engage_range=0.0,
-        danger_nav_weight=4.5,
-        loot_detour_m=45.0,
-        quiet_ring_frac=0.70,
+        danger_nav_weight=4.0,
+        loot_detour_m=42.0,
+        quiet_ring_frac=0.68,
         silent_when_hidden=True,
     ),
     "opportunistic_hunter": StrategyProfile(
         name="opportunistic_hunter",
-        bot_name="hunter-v1",
+        bot_name="hunter-v2",
         pacifist=False,
-        retreat_hp_frac=0.32,
-        outnumbered_hp_frac=0.55,
-        engage_range=185.0,
-        danger_nav_weight=1.0,
-        loot_detour_m=70.0,
-        quiet_ring_frac=0.48,
+        selective_engage=False,
+        hold_silent_at_cover=False,
+        retreat_hp_frac=0.42,
+        outnumbered_hp_frac=0.68,
+        engage_range=175.0,
+        danger_nav_weight=1.3,
+        loot_detour_m=68.0,
+        quiet_ring_frac=0.50,
         silent_when_hidden=False,
     ),
 }
@@ -139,8 +147,17 @@ class StrategyController:
                     continue
                 danger = self.threats.danger_at(wx, wy, now)
                 dist_me = math.hypot(wx - mx, wy - my)
-                has_cover = bool(self.world.loaded and self.world.cover_adj[gy * self.world.nav_nx + gx])
-                score = (28.0 if has_cover else 0.0) - danger * 24.0 - dist_me * 0.14
+                idx = gy * self.world.nav_nx + gx
+                has_cover = bool(self.world.loaded and self.world.cover_adj[idx])
+                deg = self.world.escape_deg[idx] if (self.world.loaded and self.world.escape_deg) else 6
+                # Reward building corners (4..6 neighbors = cover + escape routes), penalize dead ends (<= 2)
+                corner_bonus = 34.0 if (has_cover and 4 <= deg <= 6) else (16.0 if has_cover else 0.0)
+                if deg <= 2:
+                    corner_bonus -= 40.0
+                # Stay away from map-boundary pinch walls
+                edge_dist = min(wx - self.world.min_x, self.world.max_x - wx, wy - self.world.min_y, self.world.max_y - wy)
+                edge_pen = 22.0 if edge_dist < 28.0 else 0.0
+                score = corner_bonus - danger * 26.0 - dist_me * 0.14 - edge_pen
                 if score > best_score:
                     best_score = score
                     best_pt = (wx, wy)
@@ -242,6 +259,7 @@ class StrategyController:
                 obs,
                 self.threats,
                 allow_long_range=not zone_urgent,
+                selective=self.profile.selective_engage,
             )
 
         # Loot evaluation when safe
@@ -339,41 +357,56 @@ class StrategyController:
                 allow_fire=True,
                 laser_shorted=laser_shorted,
             )
-            # Flip strafe direction every ~1.4s so enemy lead misses
-            if now - self._last_strafe_flip_t > 1.4:
-                self._strafe_dir = -self._strafe_dir
-                self._last_strafe_flip_t = now
-
-            dx = mech_target.pos[0] - x
-            dy = mech_target.pos[1] - y
-            d = max(1.0, math.hypot(dx, dy))
-            ux, uy = dx / d, dy / d
-            # Perpendicular strafe vector
-            px, py = -uy * self._strafe_dir, ux * self._strafe_dir
-
-            has_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"])
-            enemy_has_lightning = "lightning" in mech_target.weapons
-            # Choose desired combat range
-            if has_lightning and not enemy_has_lightning and hp >= mech_target.hp * 0.85:
-                desired_r = 26.0
-            elif enemy_has_lightning:
-                desired_r = 68.0
+            # Check if primary weapon is reloading/on-cooldown -> duck behind cover while reloading!
+            gun_reloading = any(w and w["kind"] == "gun" and float(w.get("reload", 0.0)) > 0.35 for w in me["weapons"])
+            can_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"]) and math.hypot(mech_target.pos[0] - x, mech_target.pos[1] - y) < 43.0
+            if gun_reloading and not can_lightning and self.world.loaded:
+                if self._cover_pt is None or (now - self._cover_t) > 1.2:
+                    self._cover_pt = self.world.find_cover_point(pos3, mech_target.pos, play_center, play_radius, search_radius=36.0)
+                    self._cover_t = now
+                if self._cover_pt is not None:
+                    goal = self._cover_pt
+                    want_boost = dodge_vec is not None and energy > 25.0
+                else:
+                    goal = self.world.clamp_to_bounds(x - (mech_target.pos[0] - x) * 0.3, y - (mech_target.pos[1] - y) * 0.3)
             else:
-                desired_r = 55.0
+                # Flip strafe direction every ~1.4s so enemy lead misses
+                if now - self._last_strafe_flip_t > 1.4:
+                    self._strafe_dir = -self._strafe_dir
+                    self._last_strafe_flip_t = now
 
-            radial = 0.0
-            if d > desired_r + 12.0:
-                radial = 0.55
-            elif d < desired_r - 10.0:
-                radial = -0.65
+                dx = mech_target.pos[0] - x
+                dy = mech_target.pos[1] - y
+                d = max(1.0, math.hypot(dx, dy))
+                ux, uy = dx / d, dy / d
+                # Perpendicular strafe vector (flip immediately if strafing into a wall or outside safe zone!)
+                px, py = -uy * self._strafe_dir, ux * self._strafe_dir
+                if self.world.loaded and self.world.is_blocked_at(x + px * 9.0, y + py * 9.0, z, clearance=0.4):
+                    self._strafe_dir = -self._strafe_dir
+                    self._last_strafe_flip_t = now
+                    px, py = -px, -py
 
-            gx = x + (px * 0.85 + ux * radial) * 24.0
-            gy = y + (py * 0.85 + uy * radial) * 24.0
-            # Keep kiting inside active safe zone
-            if math.hypot(gx - play_center[0], gy - play_center[1]) > max(8.0, play_radius - 10.0):
-                gx, gy = next_center
-            goal = self.world.clamp_to_bounds(gx, gy)
-            want_boost = dodge_vec is not None and energy > 25.0
+                has_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"])
+                enemy_has_lightning = "lightning" in mech_target.weapons
+                if has_lightning and not enemy_has_lightning and hp >= mech_target.hp * 0.85:
+                    desired_r = 26.0
+                elif enemy_has_lightning:
+                    desired_r = 68.0
+                else:
+                    desired_r = 55.0
+
+                radial = 0.0
+                if d > desired_r + 12.0:
+                    radial = 0.55
+                elif d < desired_r - 10.0:
+                    radial = -0.65
+
+                gx = x + (px * 0.85 + ux * radial) * 24.0
+                gy = y + (py * 0.85 + uy * radial) * 24.0
+                if math.hypot(gx - play_center[0], gy - play_center[1]) > max(8.0, play_radius - 10.0):
+                    gx, gy = next_center
+                goal = self.world.clamp_to_bounds(gx, gy)
+                want_boost = dodge_vec is not None and energy > 25.0
 
         elif loot_obj is not None:
             self.mode = f"LOOT_{loot_obj.kind.upper()}"
@@ -408,29 +441,50 @@ class StrategyController:
                 )
 
         else:
-            self.mode = "SAFE_ROTATE"
-            goal = self._pick_quiet_zone_anchor(obs, next_center, next_radius)
-            want_boost = False
+            # Rooftop high-ground hold: if safely on a roof inside the safe zone with low threat, hold it!
+            on_roof = self.world.loaded and (z - self.world.terrain_height(x, y)) > 3.0
+            if (
+                on_roof
+                and in_zone
+                and math.hypot(x - play_center[0], y - play_center[1]) <= max(8.0, play_radius - 14.0)
+                and self.threats.danger_at(x, y, now) < 2.5
+            ):
+                self.mode = "ROOF_HOLD"
+                goal = (x, y)
+                want_boost = False
+            else:
+                self.mode = "SAFE_ROTATE"
+                goal = self._pick_quiet_zone_anchor(obs, next_center, next_radius)
+                want_boost = False
 
         # --- NAVIGATION ---
         charging_laser = any(w and w["kind"] == "laser" and float(w.get("charge", 0.0)) > 0.0 for w in me["weapons"])
-        suppress_stuck = charging_laser or self.mode == "COMBAT_KITE" or (
+        hold_quiet_cover = (
+            self.profile.hold_silent_at_cover
+            and self.mode in ("SAFE_ROTATE", "ROOF_HOLD")
+            and dodge_vec is None
+            and math.hypot(goal[0] - x, goal[1] - y) <= 7.0
+        )
+        suppress_stuck = charging_laser or self.mode == "COMBAT_KITE" or hold_quiet_cover or (
             self.profile.silent_when_hidden and self.mode == "SAFE_ROTATE"
         )
-        danger_sources = self.threats.snapshot_sources(now)
-        move_xy, boost, jump, _ = self.nav.update_and_steer(
-            tick=tick,
-            pos=pos3,
-            vel=vel3,
-            grounded=grounded,
-            energy=energy,
-            goal=goal,
-            danger_weight=danger_weight,
-            want_boost=want_boost,
-            dodge_vec=dodge_vec,
-            suppress_stuck=suppress_stuck,
-            danger_sources=danger_sources,
-        )
+        if hold_quiet_cover:
+            move_xy, boost, jump = [0.0, 0.0], False, False
+        else:
+            danger_sources = self.threats.snapshot_sources(now)
+            move_xy, boost, jump, _ = self.nav.update_and_steer(
+                tick=tick,
+                pos=pos3,
+                vel=vel3,
+                grounded=grounded,
+                energy=energy,
+                goal=goal,
+                danger_weight=danger_weight,
+                want_boost=want_boost,
+                dodge_vec=dodge_vec,
+                suppress_stuck=suppress_stuck,
+                danger_sources=danger_sources,
+            )
 
         # Silent walking for pacifist when already safe & hidden
         if self.profile.silent_when_hidden and self.mode == "SAFE_ROTATE" and dodge_vec is None and not boost:

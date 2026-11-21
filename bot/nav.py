@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import heapq
 import math
+import time
 from typing import Callable, List, Optional, Tuple
 
 from bot.world import Vec2, Vec3, WorldModel
@@ -38,8 +39,9 @@ class Navigator:
         goal: Vec2,
         danger_fn: Optional[Callable[[float, float], float]] = None,
         danger_weight: float = 1.0,
-        max_expansions: int = 260,
+        max_expansions: int = 220,
         danger_sources: Optional[List[Tuple[float, float, float, float, float]]] = None,
+        time_budget_s: float = 0.010,
     ) -> List[Vec2]:
         """Compute an A* path from start to goal on the navgrid, then smooth it."""
         if not self.world.loaded:
@@ -76,8 +78,12 @@ class Navigator:
         best_h = h0
         expansions = 0
         sqrt = math.sqrt
+        h_weight = 1.55 if danger_weight >= 3.0 else 1.35
+        t_start = time.perf_counter()
 
         while heap and expansions < max_expansions:
+            if (expansions & 31) == 31 and (time.perf_counter() - t_start) > time_budget_s:
+                break
             _, cur = heapq.heappop(heap)
             if cur in closed:
                 continue
@@ -136,7 +142,7 @@ class Navigator:
                     if h < best_h:
                         best_h = h
                         best_idx = n_idx
-                    heapq.heappush(heap, (tentative_g + h * 1.3, n_idx))
+                    heapq.heappush(heap, (tentative_g + h * h_weight, n_idx))
 
         # Reconstruct path
         raw: List[Vec2] = []

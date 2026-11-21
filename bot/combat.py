@@ -156,12 +156,15 @@ class CombatPlanner:
         obs: Dict[str, Any],
         threats: ThreatTracker,
         allow_long_range: bool = True,
+        selective: bool = False,
     ) -> Optional[TrackedEnemy]:
         me = obs["self"]
         mx, my, mz = me["pos"]
         muzzle_z = mz + float(me["stats"].get("muzzle_height", 7.0))
         muzzle = (mx, my, muzzle_z)
         now = float(obs["t"])
+        alive = int(obs.get("alive", 16))
+        my_hp_frac = float(me["hp"]) / max(1.0, float(me["max_hp"]))
         attackers = threats.recent_attackers(now, window=5.0)
         my_weapons = [w["kind"] for w in me["weapons"] if w is not None]
 
@@ -182,6 +185,20 @@ class CombatPlanner:
             if not has_los and not (has_mortar and 18.0 <= dist <= 220.0):
                 continue
 
+            yaw_e_to_me = math.atan2(my - e.pos[1], mx - e.pos[0])
+            e_facing_err = abs(angle_diff(yaw_e_to_me, e.aim[0]))
+            hp_frac = e.hp / max(1.0, e.max_hp)
+
+            # Selective survival discipline: avoid initiating noisy mid/long-range duels
+            # against healthy non-threatening enemies in early/mid game (protects placement!)
+            if selective and alive > 4 and e.id not in attackers:
+                threatening_me = (dist < 52.0) or (dist < 85.0 and e_facing_err < 0.35)
+                vulnerable = (e.hp <= 550.0) or (hp_frac < 0.48)
+                rear_ambush = (e_facing_err > math.pi * 0.5 and dist < 95.0 and my_hp_frac >= 0.72)
+                cookoff_shot = ("laser" in my_weapons and "mortar" in e.weapons and dist < 135.0)
+                if not (threatening_me or vulnerable or rear_ambush or cookoff_shot):
+                    continue
+
             # Avoid broadcasting noisy long-range gun shots at full-HP non-attackers unless we have a laser
             if dist > 165.0 and e.id not in attackers and e.hp > 650.0 and "laser" not in my_weapons:
                 continue
@@ -193,13 +210,10 @@ class CombatPlanner:
             if e.id in attackers:
                 score += 120.0
             # High priority for low-HP finishable enemies (cubes + placement!)
-            hp_frac = e.hp / max(1.0, e.max_hp)
             score += (1.0 - hp_frac) * 140.0
             if e.hp <= 350.0:
                 score += 90.0
             # Enemy aiming at us vs turned away from us (rear-armor 1.5x damage!)
-            yaw_e_to_me = math.atan2(my - e.pos[1], mx - e.pos[0])
-            e_facing_err = abs(angle_diff(yaw_e_to_me, e.aim[0]))
             if e_facing_err < 0.35:
                 score += 65.0
                 if e.charging:

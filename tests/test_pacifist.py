@@ -18,7 +18,7 @@ class TestPurePacifist(unittest.TestCase):
     def test_profile_is_pure_pacifist(self):
         self.assertEqual(self.bot.profile.name, "pure_pacifist")
         self.assertTrue(self.bot.profile.pacifist)
-        self.assertEqual(self.bot.name, "pacifist-v1")
+        self.assertEqual(self.bot.name, "pacifist-v2")
 
     def test_never_fires_even_when_attacked(self):
         enemy = {
