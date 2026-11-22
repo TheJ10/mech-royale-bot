@@ -1,0 +1,29 @@
+{
+  "total_ticks": 300,
+  "duration_s": 36.8,
+  "start_hp": 1400.0,
+  "end_hp": 9.5,
+  "end_cubes": 0,
+  "end_alive": 13,
+  "total_damage_dealt": 472.5,
+  "total_damage_received": 1665.0,
+  "total_zone_damage": 0.0,
+  "total_kills": 0,
+  "total_cubes_gained": 0,
+  "phase_distribution": {
+    "EARLY_GAME": 300
+  },
+  "objective_distribution": {
+    "SAFE_ROTATE": 118,
+    "COMBAT_KITE": 57,
+    "RETREAT_HEAL": 125
+  },
+  "in_zone_pct": 100.0,
+  "vis_enemy_ticks": 169,
+  "latency_ms": {
+    "p50": 0.3,
+    "p90": 1.37,
+    "p99": 4.79,
+    "max": 5.26
+  }
+}

@@ -142,23 +142,31 @@ class ResourcePlanner:
         threats: ThreatTracker,
         zone_center: Vec2,
         safe_radius: float,
-        max_detour: float = 55.0,
+        max_detour: float = 65.0,
+        allow_noisy_farm: bool = True,
+        phase_econ_mult: float = 1.0,
     ) -> Optional[LootObjective]:
         """Score visible cubes, desirable weapon pickups, crates, NPC drones, and nearby drops."""
         me = obs["self"]
         x, y, z = me["pos"]
         now = float(obs["t"])
         hp_frac = float(me["hp"]) / max(1.0, float(me["max_hp"]))
+        cubes = int(me.get("cubes", 0))
+        # Extra reward when 1 cube away from an upgrade threshold (1, 3, 6, 10)
+        threshold_bonus = 18.0 if cubes in (0, 2, 5, 9) else 0.0
         held_kinds = {w["kind"] for w in me["weapons"] if w is not None}
         need_secondary = me["weapons"][1] is None or me["weapons"][1]["kind"] == "mortar"
+        on_roof = self.world.loaded and (z - self.world.terrain_height(x, y)) > 3.0
 
         best: Optional[LootObjective] = None
 
         def consider(kind: str, pos: Vec3, tid: Optional[int], base_val: float, max_d: float) -> None:
             nonlocal best
             px, py, pz = pos
-            # Filter rooftop items using local terrain height rather than our current Z (handles campus slopes!)
-            if self.world.loaded:
+            if on_roof:
+                if abs(pz - z) > 4.5:
+                    return
+            elif self.world.loaded:
                 if (pz - self.world.terrain_height(px, py)) > 2.8:
                     return
             elif abs(pz - z) > 4.5:
@@ -166,49 +174,51 @@ class ResourcePlanner:
             d = math.hypot(px - x, py - y)
             if d > max_d:
                 return
-            # Must stay inside safe zone
             if math.hypot(px - zone_center[0], py - zone_center[1]) > safe_radius:
                 return
             danger = threats.danger_at(px, py, now)
-            if danger > 3.5:
+            if danger > 3.2:
                 return
-            score = base_val - d * 1.15 - danger * 18.0
+            score = base_val * phase_econ_mult - d * 1.10 - danger * 18.0
             if score > 0.0 and (best is None or score > best.score):
                 best = LootObjective(kind, pos, tid, score)
 
         # 1. Power cubes (free +4% HP & +4% damage + upgrades!)
         for c in obs.get("cubes") or []:
-            consider("cube", tuple(c["pos"]), int(c["id"]), 85.0, max_detour)
+            consider("cube", tuple(c["pos"]), int(c["id"]), 88.0 + threshold_bonus, max_detour)
 
         # 2. Desirable secondary weapon (lightning / laser)
         if not self.pacifist and need_secondary:
             for p in obs.get("pickups") or []:
                 k = str(p["kind"])
                 if k in ("lightning", "laser") and k not in held_kinds:
-                    consider("pickup", tuple(p["pos"]), int(p["id"]), 78.0, max_detour)
+                    consider("pickup", tuple(p["pos"]), int(p["id"]), 82.0, max_detour)
 
-        # 3. Crates (300 HP -> 1 cube + 50% weapon; quick to break with gun)
-        if not self.pacifist and hp_frac >= 0.55:
+        # 3. Crates (300 HP -> 1 cube + 50% weapon; skip noisy crate shooting if an enemy is close)
+        if allow_noisy_farm and not self.pacifist and hp_frac >= 0.55:
             for cr in obs.get("crates") or []:
-                consider("crate", tuple(cr["pos"]), int(cr["id"]), 62.0, min(48.0, max_detour))
+                consider("crate", tuple(cr["pos"]), int(cr["id"]), 64.0 + threshold_bonus * 0.5, min(52.0, max_detour))
 
-        # 4. NPC drones (350 HP -> 2 cubes! Only when healthy and no nearby enemy mechs)
-        if not self.pacifist and hp_frac >= 0.72 and not threats.visible_enemies():
+        # 4. NPC drones (350 HP -> 2 cubes! Dual-purpose: farm when healthy & isolated)
+        if allow_noisy_farm and not self.pacifist and hp_frac >= 0.72 and not threats.visible_enemies():
             for m in obs.get("mechs") or []:
                 if m.get("kind") == "npc":
-                    consider("npc", tuple(m["pos"]), int(m["id"]), 68.0, min(50.0, max_detour))
+                    consider("npc", tuple(m["pos"]), int(m["id"]), 70.0 + threshold_bonus, min(52.0, max_detour))
 
-        # 5. Supply drops (3 cubes + full heal + full energy! Hold ring if close & low threat)
-        if hp_frac >= 0.55:
+        # 5. Supply drops (3 cubes + full heal + full energy! Hold ring if close & uncontested/low threat)
+        if hp_frac >= 0.50:
             for dr in obs.get("drops") or []:
                 lands_in = float(dr.get("lands_in", 99.0))
                 if lands_in > 18.0:
                     continue
+                holder = dr.get("holder")
                 dpos = tuple(dr["pos"])
                 d_drop = math.hypot(dpos[0] - x, dpos[1] - y)
-                if d_drop <= 110.0:
-                    # Extra value if already inside/near the capture ring or actively holding it
-                    bonus = 155.0 if (d_drop <= 12.0 or dr.get("holder") == me["id"]) else 115.0
-                    consider("drop", dpos, int(dr["id"]), bonus, 110.0)
+                # Avoid walking from far away into an already-contested drop with high threat
+                if holder is not None and holder != me["id"] and d_drop > 35.0:
+                    continue
+                if d_drop <= 105.0:
+                    bonus = 160.0 if (d_drop <= 12.0 or holder == me["id"]) else 115.0
+                    consider("drop", dpos, int(dr["id"]), bonus, 105.0)
 
         return best

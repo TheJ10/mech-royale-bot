@@ -1,0 +1,51 @@
+{
+  "objectives": {
+    "SAFE_ROTATE": {
+      "ticks": 118,
+      "achieved_ticks": 58,
+      "fire_ticks": 0,
+      "boost_ticks": 0,
+      "dmg_dealt": 45.0,
+      "dmg_received": 315.0,
+      "zone_damage": 0.0,
+      "displacement_m": 203.1,
+      "mean_expected_benefit": 45.0,
+      "mean_expected_risk": 0.9,
+      "exposure_incidents": 0,
+      "achievement_rate_pct": 49.2
+    },
+    "COMBAT_KITE": {
+      "ticks": 57,
+      "achieved_ticks": 5,
+      "fire_ticks": 37,
+      "boost_ticks": 25,
+      "dmg_dealt": 157.5,
+      "dmg_received": 720.0,
+      "zone_damage": 0.0,
+      "displacement_m": 52.8,
+      "mean_expected_benefit": 196.6,
+      "mean_expected_risk": 6.5,
+      "exposure_incidents": 2,
+      "achievement_rate_pct": 8.8
+    },
+    "RETREAT_HEAL": {
+      "ticks": 125,
+      "achieved_ticks": 118,
+      "fire_ticks": 0,
+      "boost_ticks": 28,
+      "dmg_dealt": 270.0,
+      "dmg_received": 630.0,
+      "zone_damage": 0.0,
+      "displacement_m": 110.1,
+      "mean_expected_benefit": 262.3,
+      "mean_expected_risk": 4.0,
+      "exposure_incidents": 0,
+      "achievement_rate_pct": 94.4
+    }
+  },
+  "phase_breakdown": {
+    "EARLY_GAME": 300
+  },
+  "exposure_incident_count": 2,
+  "unachieved_tick_count": 118
+}

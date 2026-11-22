@@ -10,7 +10,12 @@ antigravity-prompts.txt
 arena/
 check/
 tests/
+tools/
+.sim_cache/
 *.md
+*.jsonl
+match_summary.json
+strategy_performance.json
 mechfight.schema.json
 .env
 .env.*

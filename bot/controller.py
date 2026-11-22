@@ -1,9 +1,10 @@
-"""Top-level Mech Royale bot controller wiring all modules with timing guard."""
+"""Top-level Unified Battle Intelligence MechBot controller with bounded telemetry."""
 from __future__ import annotations
 
+import atexit
 import os
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import mechfight as mf
 
@@ -11,18 +12,19 @@ from bot.combat import CombatPlanner
 from bot.nav import Navigator
 from bot.resources import ResourcePlanner
 from bot.strategy import PROFILES, StrategyController
+from bot.telemetry import DecisionTelemetry
 from bot.threat import ThreatTracker
 from bot.world import WorldModel
 
 
 class MechBot:
-    """Modular autonomous Mech Royale bot."""
+    """Unified Battle Intelligence autonomous Mech Royale bot (UBI-v1)."""
 
-    profile_name = os.environ.get("MECH_PROFILE", "tactical_survivor")
-    name = PROFILES.get(profile_name, PROFILES["tactical_survivor"]).bot_name
+    profile_name = os.environ.get("MECH_PROFILE", "unified")
+    name = PROFILES.get(profile_name, PROFILES["unified"]).bot_name
 
-    def __init__(self, hello: mf.Hello):
-        self.profile = PROFILES.get(self.profile_name, PROFILES["tactical_survivor"])
+    def __init__(self, hello: mf.Hello, trace_path: Optional[str] = None):
+        self.profile = PROFILES.get(self.profile_name, PROFILES["unified"])
         self.name = self.profile.bot_name
         config: Dict[str, Any] = hello.get("config") or {}
         mech_cfg = config.get("mech") or {}
@@ -46,16 +48,19 @@ class MechBot:
             self.resources,
             self.profile,
         )
+        self.telemetry = DecisionTelemetry(trace_path=trace_path)
+        if self.telemetry.file_enabled:
+            atexit.register(self.telemetry.finalize)
 
     def act(self, obs: mf.Observation) -> mf.Action:
         t0 = time.perf_counter()
         self.threats.update(obs)
         act, mode, goal = self.strategy.decide(obs)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        self.telemetry.record_tick(obs, self.strategy.last_decision_meta, act, dt_ms)
 
-        # Lightweight debug drawing (well within caps)
         me = obs["self"]
         x, y, z = me["pos"]
         mf.draw.point([goal[0], goal[1], z], "#40c0ff", 5)
-        dt_ms = (time.perf_counter() - t0) * 1000.0
         mf.draw.label(f"{mode} hp:{me['hp']:.0f} c:{me['cubes']} {dt_ms:.1f}ms")
         return act

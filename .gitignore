@@ -13,6 +13,7 @@ antigravity-prompts.txt
 
 # Logs and OS files
 *.log
+.sim_cache/
 .DS_Store
 Thumbs.db
 

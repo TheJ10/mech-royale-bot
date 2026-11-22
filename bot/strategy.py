@@ -1,4 +1,4 @@
-"""Strategic decision controller supporting tactical_survivor, pure_pacifist, and opportunistic_hunter."""
+"""Unified Battle Intelligence central utility-based decision controller (UBI-v1)."""
 from __future__ import annotations
 
 import math
@@ -17,57 +17,71 @@ class StrategyProfile:
     name: str
     bot_name: str
     pacifist: bool = False
-    retreat_hp_frac: float = 0.45
-    outnumbered_hp_frac: float = 0.72
-    engage_range: float = 130.0
-    danger_nav_weight: float = 2.0
-    loot_detour_m: float = 55.0
-    quiet_ring_frac: float = 0.62
+    retreat_hp_frac: float = 0.44
+    outnumbered_hp_frac: float = 0.70
+    engage_range: float = 160.0
+    danger_nav_weight: float = 2.2
+    loot_detour_m: float = 65.0
+    quiet_ring_frac: float = 0.58
     silent_when_hidden: bool = False
 
 
 PROFILES: Dict[str, StrategyProfile] = {
+    "unified": StrategyProfile(
+        name="unified",
+        bot_name="ubi-v1",
+        pacifist=False,
+        retreat_hp_frac=0.44,
+        outnumbered_hp_frac=0.70,
+        engage_range=160.0,
+        danger_nav_weight=2.2,
+        loot_detour_m=65.0,
+        quiet_ring_frac=0.58,
+        silent_when_hidden=False,
+    ),
     "tactical_survivor": StrategyProfile(
         name="tactical_survivor",
-        bot_name="tactical-surv-v2",
+        bot_name="ubi-v1",
         pacifist=False,
-        retreat_hp_frac=0.45,
-        outnumbered_hp_frac=0.72,
-        engage_range=135.0,
+        retreat_hp_frac=0.44,
+        outnumbered_hp_frac=0.70,
+        engage_range=160.0,
         danger_nav_weight=2.2,
-        loot_detour_m=55.0,
-        quiet_ring_frac=0.62,
+        loot_detour_m=65.0,
+        quiet_ring_frac=0.58,
         silent_when_hidden=False,
     ),
     "pure_pacifist": StrategyProfile(
         name="pure_pacifist",
-        bot_name="pacifist-v1",
+        bot_name="pacifist-v2",
         pacifist=True,
         retreat_hp_frac=0.99,
         outnumbered_hp_frac=0.99,
         engage_range=0.0,
-        danger_nav_weight=4.5,
+        danger_nav_weight=4.2,
         loot_detour_m=45.0,
-        quiet_ring_frac=0.70,
+        quiet_ring_frac=0.68,
         silent_when_hidden=True,
     ),
     "opportunistic_hunter": StrategyProfile(
         name="opportunistic_hunter",
-        bot_name="hunter-v1",
+        bot_name="hunter-v2.1",
         pacifist=False,
-        retreat_hp_frac=0.32,
-        outnumbered_hp_frac=0.55,
-        engage_range=185.0,
-        danger_nav_weight=1.0,
-        loot_detour_m=70.0,
-        quiet_ring_frac=0.48,
+        retreat_hp_frac=0.42,
+        outnumbered_hp_frac=0.68,
+        engage_range=175.0,
+        danger_nav_weight=1.3,
+        loot_detour_m=68.0,
+        quiet_ring_frac=0.50,
         silent_when_hidden=False,
     ),
 }
 
 
 class StrategyController:
-    """High-level mode selection and tactical goal/movement/combat coordination."""
+    """Central utility-based decision engine coordinating Combat, Survival, and Economy systems."""
+
+    HYSTERESIS_BONUS = 12.0
 
     def __init__(
         self,
@@ -85,6 +99,8 @@ class StrategyController:
         self.resources = resources
         self.profile = profile
         self.mode: str = "SAFE_ROTATE"
+        self.phase: str = "EARLY_GAME"
+        self.last_decision_meta: Dict[str, Any] = {}
         self._anchor: Optional[Vec2] = None
         self._anchor_t: float = -100.0
         self._cover_pt: Optional[Vec2] = None
@@ -92,23 +108,32 @@ class StrategyController:
         self._strafe_dir: float = 1.0
         self._last_strafe_flip_t: float = 0.0
 
+    def classify_phase(self, now: float, alive: int, next_radius: float) -> str:
+        if next_radius <= 35.0 or alive <= 2:
+            return "FINAL_CIRCLE"
+        if alive <= 5 or next_radius <= 90.0:
+            return "LATE_GAME"
+        if now < 90.0 and alive > 10 and next_radius >= 220.0:
+            return "EARLY_GAME"
+        return "MID_GAME"
+
     def _pick_quiet_zone_anchor(
         self,
         obs: Dict[str, Any],
         zone_center: Vec2,
         next_radius: float,
+        avoid_npcs: bool = False,
     ) -> Vec2:
-        """Pick a cover-adjacent, low-threat walkable position inside the next safe circle."""
+        """Pick a cover-adjacent, dead-end-free, low-threat walkable position inside the safe circle."""
         now = float(obs["t"])
         me = obs["self"]
         mx, my, _ = me["pos"]
         zcx, zcy = zone_center
 
-        # Keep existing anchor for 3.5s if still safely inside next_radius and low threat
         if self._anchor is not None and (now - self._anchor_t) < 3.5:
             ax, ay = self._anchor
             if math.hypot(ax - zcx, ay - zcy) <= max(5.0, next_radius - 8.0):
-                if self.threats.danger_at(ax, ay, now) < 3.0:
+                if self.threats.danger_at(ax, ay, now, include_npcs=avoid_npcs) < 3.0:
                     return self._anchor
 
         if next_radius <= 20.0:
@@ -121,7 +146,6 @@ class StrategyController:
         best_pt: Vec2 = self.world.clamp_to_bounds(zcx, zcy, margin=8.0)
         best_score = -1e18
 
-        # Sample 16 directions around the quiet ring + 8 inner ring points
         for ring_mult in (1.0, 0.55):
             r = ring_r * ring_mult
             count = 16 if ring_mult == 1.0 else 8
@@ -137,10 +161,17 @@ class StrategyController:
                 wx, wy = self.world.grid_to_world(gx, gy) if self.world.loaded else (cx, cy)
                 if math.hypot(wx - zcx, wy - zcy) > max(6.0, next_radius - 10.0):
                     continue
-                danger = self.threats.danger_at(wx, wy, now)
+                danger = self.threats.danger_at(wx, wy, now, include_npcs=avoid_npcs)
                 dist_me = math.hypot(wx - mx, wy - my)
-                has_cover = bool(self.world.loaded and self.world.cover_adj[gy * self.world.nav_nx + gx])
-                score = (28.0 if has_cover else 0.0) - danger * 24.0 - dist_me * 0.14
+                idx = gy * self.world.nav_nx + gx
+                has_cover = bool(self.world.loaded and self.world.cover_adj[idx])
+                deg = self.world.escape_deg[idx] if (self.world.loaded and self.world.escape_deg) else 6
+                corner_bonus = 32.0 if (has_cover and 4 <= deg <= 6) else (16.0 if has_cover else 0.0)
+                if deg <= 2:
+                    corner_bonus -= 35.0
+                edge_dist = min(wx - self.world.min_x, self.world.max_x - wx, wy - self.world.min_y, self.world.max_y - wy)
+                edge_pen = 18.0 if edge_dist < 25.0 else 0.0
+                score = corner_bonus - danger * 24.0 - dist_me * 0.14 - edge_pen
                 if score > best_score:
                     best_score = score
                     best_pt = (wx, wy)
@@ -150,17 +181,19 @@ class StrategyController:
         return best_pt
 
     def decide(self, obs: Dict[str, Any]) -> Tuple[Dict[str, Any], str, Vec2]:
-        """Compute full action dict, mode label, and current goal for debug drawing."""
+        """Evaluate candidate objectives via phase-adapted utility scoring and emit coordinated action."""
         me = obs["self"]
         x, y, z = me["pos"]
         pos3: Vec3 = (float(x), float(y), float(z))
         vel3: Vec3 = (float(me["vel"][0]), float(me["vel"][1]), float(me["vel"][2]))
         now = float(obs["t"])
         tick = int(obs["tick"])
+        alive = int(obs.get("alive", 16))
         hp = float(me["hp"])
         max_hp = max(1.0, float(me["max_hp"]))
         hp_frac = hp / max_hp
         energy = float(me["energy"])
+        cubes = int(me.get("cubes", 0))
         grounded = bool(me["grounded"])
         in_zone = bool(me["in_zone"])
         walk_speed = max(1.0, float(me["stats"].get("walk_speed", 11.7)))
@@ -173,7 +206,6 @@ class StrategyController:
         shrink_start = float(zone["shrink_start"])
         shrink_end = float(zone["shrink_end"])
 
-        # Linearly interpolate active zone circle during shrink
         if now <= shrink_start or shrink_end <= shrink_start:
             active_cx, active_cy, active_r = cur_center[0], cur_center[1], cur_radius
         elif now >= shrink_end:
@@ -185,22 +217,30 @@ class StrategyController:
             active_r = cur_radius + (next_radius - cur_radius) * alpha
         active_center: Vec2 = (active_cx, active_cy)
 
+        self.phase = self.classify_phase(now, alive, next_radius)
         safe_radius = max(0.0, next_radius - 14.0)
         dist_to_next_safe = max(0.0, math.hypot(x - next_center[0], y - next_center[1]) - safe_radius)
         dist_to_active_edge = active_r - math.hypot(x - active_cx, y - active_cy)
         walk_s = dist_to_next_safe / walk_speed
         sec_until_shrink = shrink_start - now
 
-        # In final phase (next_radius <= 10), allow normal combat/kiting while inside active circle
+        # BH-006 + BH-103: Proportional final-zone boundary clamping & active-circle pairing
         if next_radius <= 10.0:
-            zone_urgent = (not in_zone) or (dist_to_active_edge < 10.0 and active_r > 12.0)
+            edge_margin = min(10.0, active_r * 0.35)
+            zone_urgent = (not in_zone) or (active_r > 3.5 and dist_to_active_edge < edge_margin)
         else:
             zone_urgent = (not in_zone) or (dist_to_next_safe > 0.0 and sec_until_shrink <= walk_s + 12.0)
 
-        # Use active circle for loot/cover/kiting when plenty of time remains before shrink
-        play_center = active_center if sec_until_shrink > walk_s + 15.0 else next_center
-        play_radius = active_r if sec_until_shrink > walk_s + 15.0 else max(next_radius, active_r if next_radius <= 10.0 else next_radius)
+        use_active_circle = (sec_until_shrink > walk_s + 15.0) or (next_radius <= 10.0)
+        play_center = active_center if use_active_circle else next_center
+        play_radius = active_r if use_active_circle else next_radius
+        safe_play_r = max(0.0, play_radius - min(10.0, play_radius * 0.30))
+
         laser_shorted = now < self.threats.laser_short_until_t
+        charging_laser = any(w and w["kind"] == "laser" and float(w.get("charge", 0.0)) > 0.0 for w in me["weapons"])
+        laser_ready = (not laser_shorted) and any(
+            w and w["kind"] == "laser" and float(w.get("cooldown", 0.0)) <= 0.05 for w in me["weapons"]
+        )
 
         vis_enemies = self.threats.visible_enemies()
         nearest_enemy: Optional[TrackedEnemy] = None
@@ -211,16 +251,18 @@ class StrategyController:
                 nearest_dist = d
                 nearest_enemy = e
 
-        # Incoming projectile / charging laser dodge
         dodge_vec = self.threats.compute_dodge_vector(obs, next_center)
 
-        # Evaluate retreat condition
+        # Phase-adapted thresholds
+        retreat_thresh = 0.34 if self.phase == "FINAL_CIRCLE" and alive <= 2 else self.profile.retreat_hp_frac
+        outnum_thresh = self.profile.outnumbered_hp_frac
+        econ_mult = 1.22 if self.phase == "EARLY_GAME" else (1.05 if self.phase == "MID_GAME" else 0.85)
+
         close_enemies = [e for e in vis_enemies if math.hypot(e.pos[0] - x, e.pos[1] - y) < 85.0]
-        outnumbered = len(close_enemies) >= 2 and hp_frac < self.profile.outnumbered_hp_frac
-        low_hp_threat = hp_frac < self.profile.retreat_hp_frac and (
+        outnumbered = len(close_enemies) >= 2 and hp_frac < outnum_thresh
+        low_hp_threat = hp_frac < retreat_thresh and (
             nearest_enemy is not None or self.threats.damage_taken_recent > 80.0
         )
-        # Disadvantageous 1v1: enemy has much more HP & cubes and isn't low
         bad_duel = (
             nearest_enemy is not None
             and not self.profile.pacifist
@@ -228,14 +270,22 @@ class StrategyController:
             and nearest_enemy.hp > 450.0
             and hp_frac < 0.65
         )
+        # Dual-purpose NPC emergency check: only retreat from an NPC if critically low (<38% HP), no enemy mech, and taking NPC fire
+        npc_emergency = (
+            nearest_enemy is None
+            and hp_frac < 0.38
+            and (now - self.threats.last_npc_damaged_t) <= 2.5
+            and bool(self.threats.visible_npcs())
+        )
         want_retreat = (
             (self.profile.pacifist and (nearest_enemy is not None and nearest_dist < 110.0))
             or low_hp_threat
             or outnumbered
             or bad_duel
+            or npc_emergency
         )
 
-        # Target selection (if not pacifist)
+        # Candidate target & resource evaluation
         mech_target: Optional[TrackedEnemy] = None
         if not self.profile.pacifist:
             mech_target = self.combat.select_mech_target(
@@ -243,51 +293,117 @@ class StrategyController:
                 self.threats,
                 allow_long_range=not zone_urgent,
             )
+        target_prio = getattr(self.combat, "last_target_score", 0.0)
 
-        # Loot evaluation when safe
         loot_obj: Optional[LootObjective] = None
         if not zone_urgent and not want_retreat and (mech_target is None or nearest_dist > 85.0):
             loot_obj = self.resources.find_best_loot(
                 obs,
                 self.threats,
                 play_center,
-                max(5.0, play_radius - 10.0),
+                safe_play_r,
                 max_detour=self.profile.loot_detour_m,
+                allow_noisy_farm=(nearest_dist > 80.0),
+                phase_econ_mult=econ_mult,
             )
 
-        # --- MODE SELECTION ---
+        # --- UTILITY SCORING ACROSS CANDIDATE OBJECTIVES ---
+        local_danger = self.threats.danger_at(x, y, now, include_npcs=(hp_frac < 0.65))
+        candidates_considered: List[str] = ["SAFE_ROTATE"]
+        scores: Dict[str, float] = {}
+        benefits: Dict[str, float] = {}
+        risks: Dict[str, float] = {}
+        reasons: List[str] = [f"PHASE_{self.phase}"]
+
+        # 1. SAFE_ROTATE baseline score
+        b_safe = 45.0
+        r_safe = local_danger * 8.0
+        scores["SAFE_ROTATE"] = round(b_safe - r_safe + (self.HYSTERESIS_BONUS if self.mode == "SAFE_ROTATE" else 0.0), 1)
+        benefits["SAFE_ROTATE"] = b_safe
+        risks["SAFE_ROTATE"] = round(r_safe, 1)
+
+        # 2. ZONE_URGENT score
+        if zone_urgent:
+            candidates_considered.append("ZONE_URGENT")
+            b_zone = 260.0 + float(zone.get("dps", 20.0)) * 1.5
+            r_zone = local_danger * 5.0
+            scores["ZONE_URGENT"] = round(b_zone - r_zone, 1)
+            benefits["ZONE_URGENT"] = round(b_zone, 1)
+            risks["ZONE_URGENT"] = round(r_zone, 1)
+
+        # 3. RETREAT_HEAL score
+        if want_retreat:
+            candidates_considered.append("RETREAT_HEAL")
+            b_ret = 195.0 + (1.0 - hp_frac) * 90.0
+            r_ret = local_danger * 6.0
+            scores["RETREAT_HEAL"] = round(b_ret - r_ret + (self.HYSTERESIS_BONUS if self.mode == "RETREAT_HEAL" else 0.0), 1)
+            benefits["RETREAT_HEAL"] = round(b_ret, 1)
+            risks["RETREAT_HEAL"] = round(r_ret, 1)
+
+        # 4. COMBAT_KITE score
+        if mech_target is not None and not self.profile.pacifist and not zone_urgent and not want_retreat:
+            candidates_considered.append("COMBAT_KITE")
+            cube_adv = (cubes - mech_target.cubes) * 6.0
+            b_cmb = 110.0 + min(120.0, target_prio * 0.45) + max(-20.0, min(30.0, cube_adv))
+            r_cmb = (1.0 - hp_frac) * 55.0 + (20.0 if len(close_enemies) >= 2 else 0.0)
+            scores["COMBAT_KITE"] = round(b_cmb - r_cmb + (self.HYSTERESIS_BONUS if self.mode == "COMBAT_KITE" else 0.0), 1)
+            benefits["COMBAT_KITE"] = round(b_cmb, 1)
+            risks["COMBAT_KITE"] = round(r_cmb, 1)
+
+        # 5. RESOURCE ECONOMY score
+        if loot_obj is not None and not zone_urgent and not want_retreat:
+            l_mode = f"LOOT_{loot_obj.kind.upper()}"
+            candidates_considered.append(l_mode)
+            b_loot = 75.0 + loot_obj.score
+            r_loot = local_danger * 10.0 + (25.0 if mech_target is not None else 0.0)
+            # If no enemy mech is engaged, resource objective wins; if distant enemy exists, high-value cube/drop can still win
+            scores[l_mode] = round(b_loot - r_loot + (self.HYSTERESIS_BONUS if self.mode == l_mode else 0.0), 1)
+            benefits[l_mode] = round(b_loot, 1)
+            risks[l_mode] = round(r_loot, 1)
+
+        # --- EXECUTE PRIORITY-CONSTRAINED UTILITY SELECTION ---
         goal: Vec2 = next_center
         want_boost = False
         combat_plan = CombatPlan()
         danger_weight = self.profile.danger_nav_weight
+        avoid_npcs_nav = hp_frac < 0.65
 
         if zone_urgent:
             self.mode = "ZONE_URGENT"
-            goal = self._pick_quiet_zone_anchor(obs, next_center, next_radius)
+            reasons.append("OUTSIDE_ZONE" if not in_zone else "SHRINK_DEADLINE")
+            goal = self._pick_quiet_zone_anchor(obs, next_center, next_radius, avoid_npcs=avoid_npcs_nav)
             want_boost = (not in_zone) or (energy > 30.0 and dist_to_next_safe > 25.0)
-            danger_weight = 1.2  # Don't take huge detours outside the zone
+            danger_weight = 1.2
             if mech_target is not None and not self.profile.pacifist:
-                # Shoot back opportunistically while rotating to safety
                 t_center = (mech_target.pos[0], mech_target.pos[1], mech_target.pos[2] + 4.5)
                 combat_plan = self.combat.plan_attack_on_point(
-                    obs,
-                    t_center,
-                    mech_target.vel,
-                    mech_target.id,
-                    mech_target.weapons,
-                    mech_target.hp,
-                    is_mech=True,
-                    allow_fire=True,
-                    laser_shorted=laser_shorted,
+                    obs, t_center, mech_target.vel, mech_target.id,
+                    mech_target.weapons, mech_target.hp, is_mech=True,
+                    allow_fire=True, laser_shorted=laser_shorted,
                 )
 
         elif want_retreat:
             self.mode = "RETREAT_HEAL"
-            threat_ref = nearest_enemy.pos if nearest_enemy is not None else (
-                x + math.cos(self.threats.rear_alert_bearing or 0.0) * 40.0,
-                y + math.sin(self.threats.rear_alert_bearing or 0.0) * 40.0,
-                z,
-            )
+            if outnumbered:
+                reasons.append("OUTNUMBERED_RETREAT")
+            elif bad_duel:
+                reasons.append("UNFAVORABLE_DUEL_HP")
+            elif npc_emergency:
+                reasons.append("NPC_CRITICAL_AVOID")
+            else:
+                reasons.append("LOW_HP_MOVING_RETREAT")
+
+            if nearest_enemy is not None:
+                threat_ref = nearest_enemy.pos
+            elif npc_emergency and self.threats.visible_npcs():
+                threat_ref = self.threats.visible_npcs()[0]["pos"]
+            else:
+                threat_ref = (
+                    x + math.cos(self.threats.rear_alert_bearing or 0.0) * 40.0,
+                    y + math.sin(self.threats.rear_alert_bearing or 0.0) * 40.0,
+                    z,
+                )
+            # Active moving retreat: pick cover point and keep moving if approached (never freeze for 55 ticks!)
             if self._cover_pt is None or (now - self._cover_t) > 1.5 or math.hypot(self._cover_pt[0] - x, self._cover_pt[1] - y) < 6.0:
                 self._cover_pt = self.world.find_cover_point(pos3, threat_ref, play_center, play_radius)
                 self._cover_t = now
@@ -295,90 +411,107 @@ class StrategyController:
             if cover_pt is not None:
                 goal = cover_pt
             else:
-                # Back away toward quiet zone anchor
                 away_yaw = math.atan2(y - threat_ref[1], x - threat_ref[0])
-                cand_x = x + math.cos(away_yaw) * 45.0
-                cand_y = y + math.sin(away_yaw) * 45.0
-                if math.hypot(cand_x - play_center[0], cand_y - play_center[1]) <= max(10.0, play_radius - 8.0):
+                step_r = min(45.0, max(6.0, safe_play_r))
+                cand_x = x + math.cos(away_yaw) * step_r
+                cand_y = y + math.sin(away_yaw) * step_r
+                if math.hypot(cand_x - play_center[0], cand_y - play_center[1]) <= max(1.0, safe_play_r):
                     goal = self.world.clamp_to_bounds(cand_x, cand_y)
                 else:
-                    goal = self._pick_quiet_zone_anchor(obs, next_center, next_radius)
+                    goal = self._pick_quiet_zone_anchor(obs, next_center, next_radius, avoid_npcs=True)
             want_boost = energy > 22.0 and (nearest_dist < 70.0 or dodge_vec is not None)
             danger_weight = 3.5
+            avoid_npcs_nav = True
 
-            # Protect rear armor: face nearest threat! Fire ONLY if very close or enemy is finishable
             if nearest_enemy is not None:
                 t_center = (nearest_enemy.pos[0], nearest_enemy.pos[1], nearest_enemy.pos[2] + 4.5)
                 allow_defensive_fire = (
                     not self.profile.pacifist
-                    and (nearest_enemy.hp <= 220.0 or nearest_dist < 32.0)
+                    and (nearest_enemy.hp <= 240.0 or nearest_dist < 35.0)
                 )
                 combat_plan = self.combat.plan_attack_on_point(
-                    obs,
-                    t_center,
-                    nearest_enemy.vel,
-                    nearest_enemy.id,
-                    nearest_enemy.weapons,
-                    nearest_enemy.hp,
-                    is_mech=True,
-                    allow_fire=allow_defensive_fire,
-                    laser_shorted=laser_shorted,
+                    obs, t_center, nearest_enemy.vel, nearest_enemy.id,
+                    nearest_enemy.weapons, nearest_enemy.hp, is_mech=True,
+                    allow_fire=allow_defensive_fire, laser_shorted=laser_shorted,
                 )
 
         elif mech_target is not None and not self.profile.pacifist:
             self.mode = "COMBAT_KITE"
+            if mech_target.hp <= 400.0:
+                reasons.append("FINISH_WOUNDED_TARGET")
+            else:
+                reasons.append("FAVORABLE_ENGAGEMENT")
             t_center = (mech_target.pos[0], mech_target.pos[1], mech_target.pos[2] + 4.5)
             combat_plan = self.combat.plan_attack_on_point(
-                obs,
-                t_center,
-                mech_target.vel,
-                mech_target.id,
-                mech_target.weapons,
-                mech_target.hp,
-                is_mech=True,
-                allow_fire=True,
-                laser_shorted=laser_shorted,
+                obs, t_center, mech_target.vel, mech_target.id,
+                mech_target.weapons, mech_target.hp, is_mech=True,
+                allow_fire=True, laser_shorted=laser_shorted,
             )
-            # Flip strafe direction every ~1.4s so enemy lead misses
-            if now - self._last_strafe_flip_t > 1.4:
-                self._strafe_dir = -self._strafe_dir
-                self._last_strafe_flip_t = now
 
-            dx = mech_target.pos[0] - x
-            dy = mech_target.pos[1] - y
-            d = max(1.0, math.hypot(dx, dy))
-            ux, uy = dx / d, dy / d
-            # Perpendicular strafe vector
-            px, py = -uy * self._strafe_dir, ux * self._strafe_dir
-
-            has_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"])
-            enemy_has_lightning = "lightning" in mech_target.weapons
-            # Choose desired combat range
-            if has_lightning and not enemy_has_lightning and hp >= mech_target.hp * 0.85:
-                desired_r = 26.0
-            elif enemy_has_lightning:
-                desired_r = 68.0
+            # BH-005: Reload-in-cover when primary gun is reloading & no laser/lightning active
+            gun_reloading = any(w and w["kind"] == "gun" and float(w.get("reload", 0.0)) > 0.35 for w in me["weapons"])
+            can_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"]) and math.hypot(mech_target.pos[0] - x, mech_target.pos[1] - y) < 43.0
+            laser_active = charging_laser or (laser_ready and combat_plan.weapon_kind == "laser")
+            if gun_reloading and not can_lightning and not laser_active and self.world.loaded:
+                reasons.append("RELOAD_IN_COVER")
+                if self._cover_pt is None or (now - self._cover_t) > 1.2:
+                    self._cover_pt = self.world.find_cover_point(pos3, mech_target.pos, play_center, play_radius, search_radius=36.0)
+                    self._cover_t = now
+                if self._cover_pt is not None:
+                    goal = self._cover_pt
+                else:
+                    away_dx = x - mech_target.pos[0]
+                    away_dy = y - mech_target.pos[1]
+                    away_n = max(1.0, math.hypot(away_dx, away_dy))
+                    step_d = min(18.0, max(4.0, safe_play_r))
+                    fx = x + (away_dx / away_n) * step_d
+                    fy = y + (away_dy / away_n) * step_d
+                    if math.hypot(fx - play_center[0], fy - play_center[1]) > safe_play_r:
+                        fx, fy = play_center
+                    goal = self.world.clamp_to_bounds(fx, fy)
+                want_boost = dodge_vec is not None and energy > 25.0
             else:
-                desired_r = 55.0
+                if now - self._last_strafe_flip_t > 1.4:
+                    self._strafe_dir = -self._strafe_dir
+                    self._last_strafe_flip_t = now
 
-            radial = 0.0
-            if d > desired_r + 12.0:
-                radial = 0.55
-            elif d < desired_r - 10.0:
-                radial = -0.65
+                dx = mech_target.pos[0] - x
+                dy = mech_target.pos[1] - y
+                d = max(1.0, math.hypot(dx, dy))
+                ux, uy = dx / d, dy / d
+                px, py = -uy * self._strafe_dir, ux * self._strafe_dir
+                if self.world.loaded and self.world.is_blocked_at(x + px * 9.0, y + py * 9.0, z, clearance=0.4):
+                    self._strafe_dir = -self._strafe_dir
+                    self._last_strafe_flip_t = now
+                    px, py = -px, -py
 
-            gx = x + (px * 0.85 + ux * radial) * 24.0
-            gy = y + (py * 0.85 + uy * radial) * 24.0
-            # Keep kiting inside active safe zone
-            if math.hypot(gx - play_center[0], gy - play_center[1]) > max(8.0, play_radius - 10.0):
-                gx, gy = next_center
-            goal = self.world.clamp_to_bounds(gx, gy)
-            want_boost = dodge_vec is not None and energy > 25.0
+                has_lightning = any(w and w["kind"] == "lightning" for w in me["weapons"])
+                enemy_has_lightning = "lightning" in mech_target.weapons
+                if has_lightning and not enemy_has_lightning and hp >= mech_target.hp * 0.85:
+                    desired_r = 26.0
+                elif enemy_has_lightning:
+                    desired_r = 68.0
+                else:
+                    desired_r = 55.0
+
+                radial = 0.0
+                if d > desired_r + 12.0:
+                    radial = 0.55
+                elif d < desired_r - 10.0:
+                    radial = -0.65
+
+                step_k = min(24.0, max(4.0, safe_play_r))
+                gx = x + (px * 0.85 + ux * radial) * step_k
+                gy = y + (py * 0.85 + uy * radial) * step_k
+                if math.hypot(gx - play_center[0], gy - play_center[1]) > safe_play_r:
+                    gx, gy = play_center
+                goal = self.world.clamp_to_bounds(gx, gy)
+                want_boost = dodge_vec is not None and energy > 25.0
 
         elif loot_obj is not None:
             self.mode = f"LOOT_{loot_obj.kind.upper()}"
+            reasons.append(f"ACQUIRE_{loot_obj.kind.upper()}")
             lx, ly = loot_obj.pos[0], loot_obj.pos[1]
-            # Gentle strafe inside supply-drop 8m ring while capturing, or around NPC drones to dodge 90m/s bullets
             if loot_obj.kind == "drop" and math.hypot(lx - x, ly - y) < 6.0:
                 ang = now * 1.8
                 goal = (lx + math.cos(ang) * 3.5, ly + math.sin(ang) * 3.5)
@@ -396,28 +529,29 @@ class StrategyController:
                 z_off = 1.2 if loot_obj.kind == "crate" else 1.8
                 t_pos = (loot_obj.pos[0], loot_obj.pos[1], loot_obj.pos[2] + z_off)
                 combat_plan = self.combat.plan_attack_on_point(
-                    obs,
-                    t_pos,
-                    (0.0, 0.0, 0.0),
-                    loot_obj.target_id,
-                    None,
-                    300.0 if loot_obj.kind == "crate" else 350.0,
-                    is_mech=False,
-                    allow_fire=True,
-                    laser_shorted=laser_shorted,
+                    obs, t_pos, (0.0, 0.0, 0.0), loot_obj.target_id,
+                    None, 300.0 if loot_obj.kind == "crate" else 350.0,
+                    is_mech=False, allow_fire=True, laser_shorted=laser_shorted,
                 )
 
         else:
             self.mode = "SAFE_ROTATE"
-            goal = self._pick_quiet_zone_anchor(obs, next_center, next_radius)
+            reasons.append("CORNER_COVER_ANCHOR")
+            goal = self._pick_quiet_zone_anchor(obs, next_center, next_radius, avoid_npcs=avoid_npcs_nav)
             want_boost = False
 
+        if dodge_vec is not None:
+            reasons.append("EVADE_INCOMING_FIRE")
+
         # --- NAVIGATION ---
-        charging_laser = any(w and w["kind"] == "laser" and float(w.get("charge", 0.0)) > 0.0 for w in me["weapons"])
         suppress_stuck = charging_laser or self.mode == "COMBAT_KITE" or (
             self.profile.silent_when_hidden and self.mode == "SAFE_ROTATE"
         )
-        danger_sources = self.threats.snapshot_sources(now)
+        danger_sources = self.threats.snapshot_sources(
+            now,
+            include_npcs=(self.mode != "LOOT_NPC" and avoid_npcs_nav),
+            npc_weight=5.0 if hp_frac < 0.55 else 3.5,
+        )
         move_xy, boost, jump, _ = self.nav.update_and_steer(
             tick=tick,
             pos=pos3,
@@ -432,9 +566,7 @@ class StrategyController:
             danger_sources=danger_sources,
         )
 
-        # Silent walking for pacifist when already safe & hidden
         if self.profile.silent_when_hidden and self.mode == "SAFE_ROTATE" and dodge_vec is None and not boost:
-            # Step sound threshold is 5.0 m/s; keep speed ~4.2 m/s
             scale = min(1.0, 4.2 / walk_speed)
             move_xy = [move_xy[0] * scale, move_xy[1] * scale]
 
@@ -443,8 +575,9 @@ class StrategyController:
             aim = combat_plan.aim
         elif self.threats.rear_alert_bearing is not None:
             aim = [self.threats.rear_alert_bearing, 0.0]
+        elif nearest_enemy is not None and (nearest_dist < 160.0 or (nearest_enemy.charging and nearest_dist < 260.0)):
+            aim = [math.atan2(nearest_enemy.pos[1] - y, nearest_enemy.pos[0] - x), 0.0]
         else:
-            # Smooth torso scan around movement heading so 120° FOV sweeps 360°
             move_yaw = math.atan2(move_xy[1], move_xy[0]) if math.hypot(move_xy[0], move_xy[1]) > 0.1 else float(me["aim"][0])
             scan_offset = math.sin(now * 1.1) * 1.25
             aim = [math.remainder(move_yaw + scan_offset, math.tau), 0.0]
@@ -473,5 +606,27 @@ class StrategyController:
             act["take"] = take_id
             if drop_slot is not None:
                 act["drop"] = drop_slot
+
+        # Record structured decision metadata for DecisionTelemetry
+        self.last_decision_meta = {
+            "phase": self.phase,
+            "selected_objective": self.mode,
+            "candidates": candidates_considered,
+            "scores": scores,
+            "risk_factors": {
+                "local_danger": round(local_danger, 2),
+                "dist_to_next_safe": round(dist_to_next_safe, 1),
+                "sec_until_shrink": round(sec_until_shrink, 1),
+                "recent_dmg_3s": round(self.threats.damage_taken_recent, 1),
+                "outnumbered": outnumbered,
+                "incoming_dodge": dodge_vec is not None,
+            },
+            "target_id": combat_plan.target_id,
+            "target_priority": target_prio if mech_target is not None else (loot_obj.score if loot_obj is not None else 0.0),
+            "goal": goal,
+            "reason_codes": reasons,
+            "expected_benefit": benefits.get(self.mode, 0.0),
+            "expected_risk": risks.get(self.mode, 0.0),
+        }
 
         return (act, self.mode, goal)

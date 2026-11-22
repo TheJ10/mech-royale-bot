@@ -182,8 +182,16 @@ class CombatPlanner:
             if not has_los and not (has_mortar and 18.0 <= dist <= 220.0):
                 continue
 
-            # Avoid broadcasting noisy long-range gun shots at full-HP non-attackers unless we have a laser
-            if dist > 165.0 and e.id not in attackers and e.hp > 650.0 and "laser" not in my_weapons:
+            # Avoid broadcasting noisy long-range gun shots at full-HP non-attackers unless we have a laser or they are charging a laser at us
+            yaw_e_to_me = math.atan2(my - e.pos[1], mx - e.pos[0])
+            e_facing_err = abs(angle_diff(yaw_e_to_me, e.aim[0]))
+            if (
+                dist > 165.0
+                and e.id not in attackers
+                and e.hp > 650.0
+                and "laser" not in my_weapons
+                and not (e.charging and e_facing_err < 0.35)
+            ):
                 continue
 
             score = 0.0
@@ -198,8 +206,6 @@ class CombatPlanner:
             if e.hp <= 350.0:
                 score += 90.0
             # Enemy aiming at us vs turned away from us (rear-armor 1.5x damage!)
-            yaw_e_to_me = math.atan2(my - e.pos[1], mx - e.pos[0])
-            e_facing_err = abs(angle_diff(yaw_e_to_me, e.aim[0]))
             if e_facing_err < 0.35:
                 score += 65.0
                 if e.charging:
@@ -218,6 +224,7 @@ class CombatPlanner:
                 best_score = score
                 best = e
 
+        self.last_target_score: float = best_score if best is not None else 0.0
         return best
 
     def _mortar_launch_clear(self, muzzle: Vec3, yaw: float, pitch: float, speed: float, gravity: float) -> bool:
