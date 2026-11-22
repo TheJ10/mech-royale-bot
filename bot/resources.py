@@ -35,8 +35,14 @@ _UPGRADE_BASE_WEIGHTS: Dict[str, float] = {
 
 # Weapon preference ranking for slot 1 (slot 0 kept as gun)
 # Avoid holding mortar unless nothing else, due to +60% laser cook-off vulnerability.
-_WEAPON_RANK: Dict[str, int] = {
+_WEAPON_RANK_OPEN: Dict[str, int] = {
+    "laser": 4,
     "lightning": 3,
+    "gun": 2,
+    "mortar": 1,
+}
+_WEAPON_RANK_CLOSE: Dict[str, int] = {
+    "lightning": 4,
     "laser": 3,
     "gun": 2,
     "mortar": 1,
@@ -80,6 +86,7 @@ class ResourcePlanner:
         self.mech_radius = float(mech_cfg.get("radius", 2.5))
         self.size_per_cube = float(cubes_cfg.get("size_per_cube", 0.04))
         self._failed_crates: Dict[int, float] = {}
+        self._crate_standoff_cache: Dict[int, Tuple[float, Optional[Vec2], Vec2]] = {}
 
     def mark_crate_failed(self, crate_id: int, now: float, cooldown_s: float = 35.0) -> None:
         """Blacklist an unreachable or timed-out crate for `cooldown_s` seconds."""
@@ -137,6 +144,7 @@ class ResourcePlanner:
         threats: ThreatTracker,
         zone_center: Vec2,
         safe_radius: float,
+        crate_id: Optional[int] = None,
     ) -> Optional[Vec2]:
         """Return current pos if already valid, else best walkable/zone-safe standoff point with LoS."""
         me = obs["self"]
@@ -151,16 +159,30 @@ class ResourcePlanner:
         ):
             return (mx, my)
 
+        if crate_id is not None:
+            cached = self._crate_standoff_cache.get(crate_id)
+            if cached is not None and (now - cached[0]) < 0.6:
+                c_pt, from_xy = cached[1], cached[2]
+                if c_pt is not None:
+                    if (
+                        math.hypot(c_pt[0] - zone_center[0], c_pt[1] - zone_center[1]) <= safe_radius
+                        and threats.danger_at(c_pt[0], c_pt[1], now) <= 3.2
+                    ):
+                        return c_pt
+                elif math.hypot(mx - from_xy[0], my - from_xy[1]) < 6.0:
+                    return None
+
         target_pt = self.crate_aim_point(crate_pos)
         min_d = self.min_crate_standoff(mz + muzzle_h, target_pt[2])
         pref_d = max(min_d + 2.0, 11.5)
-        radii = (pref_d, min_d + 1.2, min(pref_d + 3.5, 18.0))
+        radii = (pref_d, min_d + 1.2)
         base_ang = math.atan2(my - cy, mx - cx)
+        k_order = (0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6)
 
         best_pt: Optional[Vec2] = None
         best_score = -1e18
         for r in radii:
-            for k in range(12):
+            for k in k_order:
                 ang = base_ang + (math.tau * k) / 12.0
                 sx = cx + math.cos(ang) * r
                 sy = cy + math.sin(ang) * r
@@ -186,9 +208,15 @@ class ResourcePlanner:
                 if score > best_score:
                     best_score = score
                     best_pt = (sx, sy)
+                if travel <= 14.0 and danger < 0.4:
+                    break
+            if best_pt is not None and best_score > -14.5:
+                break
+        if crate_id is not None:
+            self._crate_standoff_cache[crate_id] = (now, best_pt, (mx, my))
         return best_pt
 
-    def choose_upgrade(self, obs: Dict[str, Any]) -> Optional[int]:
+    def choose_upgrade(self, obs: Dict[str, Any], phase: str = "MID_GAME") -> Optional[int]:
         offer = obs.get("offer")
         if not offer:
             return None
@@ -198,6 +226,7 @@ class ResourcePlanner:
 
         me = obs["self"]
         hp_frac = float(me["hp"]) / max(1.0, float(me["max_hp"]))
+        held_kinds = {w["kind"] for w in me["weapons"] if w is not None}
         best_i = 0
         best_score = -1e9
         for i, ch in enumerate(choices):
@@ -210,14 +239,34 @@ class ResourcePlanner:
                 elif uid.startswith(("gun_", "laser_", "lightning_", "mortar_")):
                     score -= 60.0
             else:
-                if hp_frac < 0.7 and uid in ("nanites", "plating", "armor"):
-                    score += 18.0
+                if "lightning" in held_kinds:
+                    if uid == "lightning_range":
+                        score += 16.0
+                    elif uid == "lightning_efficiency":
+                        score += 8.0
+                    elif uid == "lightning_chain":
+                        score += 6.0
+                if "laser" in held_kinds:
+                    if uid == "laser_charge":
+                        score += 14.0
+                    elif uid == "laser_damage":
+                        score += 12.0
+                if phase in ("LATE_GAME", "FINAL_CIRCLE") or hp_frac < 0.72:
+                    if uid == "nanites":
+                        score += 20.0
+                    elif uid in ("plating", "armor"):
+                        score += 16.0
+                    elif uid == "gyros":
+                        score += 10.0
+                elif phase == "EARLY_GAME":
+                    if uid in ("servos", "gun_rate", "gun_damage", "sensors"):
+                        score += 8.0
             if score > best_score:
                 best_score = score
                 best_i = i
         return best_i
 
-    def choose_weapon_take(self, obs: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    def choose_weapon_take(self, obs: Dict[str, Any], phase: str = "MID_GAME") -> Tuple[Optional[int], Optional[int]]:
         """Return (pickup_id, drop_slot) if a desirable weapon is within pickup_radius."""
         if self.pacifist:
             return (None, None)
@@ -226,6 +275,7 @@ class ResourcePlanner:
         x, y, z = me["pos"]
         weapons = me["weapons"]
         held_kinds = {w["kind"] for w in weapons if w is not None}
+        rank_table = _WEAPON_RANK_CLOSE if phase in ("LATE_GAME", "FINAL_CIRCLE") else _WEAPON_RANK_OPEN
 
         # Never swap/drop a charging laser
         slot1 = weapons[1]
@@ -241,19 +291,18 @@ class ResourcePlanner:
             kind = str(p["kind"])
             if kind in held_kinds:
                 continue
-            rank = _WEAPON_RANK.get(kind, 0)
+            rank = rank_table.get(kind, 0)
             if rank <= 0:
                 continue
 
-            # Empty slot 1: take lightning, laser, or mortar (if nothing else)
+            # Empty slot 1: take lightning or laser (avoid mortar to dodge +60% cookoff)
             if slot1 is None:
-                # Prefer lightning/laser; still take mortar if empty? Actually avoid mortar to dodge +60% cookoff
                 if kind == "mortar":
                     continue
                 if best_take is None or rank > best_take[2]:
                     best_take = (int(p["id"]), None, rank)
             elif not slot1_charging:
-                cur_rank = _WEAPON_RANK.get(slot1["kind"], 0)
+                cur_rank = rank_table.get(slot1["kind"], 0)
                 if rank > cur_rank:
                     if best_take is None or rank > best_take[2]:
                         best_take = (int(p["id"]), 1, rank)
@@ -271,11 +320,17 @@ class ResourcePlanner:
         max_detour: float = 65.0,
         allow_noisy_farm: bool = True,
         phase_econ_mult: float = 1.0,
+        phase: str = "MID_GAME",
+        inward_dir: Optional[Vec2] = None,
     ) -> Optional[LootObjective]:
         """Score visible cubes, desirable weapon pickups, crates, NPC drones, and nearby drops."""
         me = obs["self"]
         x, y, z = me["pos"]
         now = float(obs["t"])
+        if len(self._failed_crates) > 32:
+            self._failed_crates = {k: v for k, v in self._failed_crates.items() if now < v}
+        if len(self._crate_standoff_cache) > 32:
+            self._crate_standoff_cache = {k: v for k, v in self._crate_standoff_cache.items() if (now - v[0]) < 2.0}
         hp_frac = float(me["hp"]) / max(1.0, float(me["max_hp"]))
         cubes = int(me.get("cubes", 0))
         # Extra reward when 1 cube away from an upgrade threshold (1, 3, 6, 10)
@@ -293,6 +348,7 @@ class ResourcePlanner:
             base_val: float,
             max_d: float,
             standoff: Optional[Vec2] = None,
+            max_danger: float = 3.2,
         ) -> None:
             nonlocal best
             px, py, pz = pos
@@ -310,9 +366,12 @@ class ResourcePlanner:
             if math.hypot(px - zone_center[0], py - zone_center[1]) > safe_radius:
                 return
             danger = threats.danger_at(px, py, now)
-            if danger > 3.2:
+            if danger > max_danger:
                 return
-            score = base_val * phase_econ_mult - d * 1.10 - danger * 18.0
+            align_bonus = 0.0
+            if inward_dir is not None and d > 1.0:
+                align_bonus = (((px - x) * inward_dir[0] + (py - y) * inward_dir[1]) / d) * 12.0
+            score = base_val * phase_econ_mult - d * 1.10 - danger * 18.0 + align_bonus
             if score > 0.0 and (best is None or score > best.score):
                 best = LootObjective(kind, pos, tid, score, standoff_pos=standoff)
 
@@ -322,25 +381,50 @@ class ResourcePlanner:
 
         # 2. Desirable secondary weapon (lightning / laser)
         if not self.pacifist and need_secondary:
+            w_val = 112.0 if phase == "EARLY_GAME" else 92.0
+            w_detour = max(max_detour, 92.0)
             for p in obs.get("pickups") or []:
                 k = str(p["kind"])
                 if k in ("lightning", "laser") and k not in held_kinds:
-                    consider("pickup", tuple(p["pos"]), int(p["id"]), 82.0, max_detour)
+                    consider("pickup", tuple(p["pos"]), int(p["id"]), w_val, w_detour)
 
-        # 3. Crates (300 HP -> 1 cube + 50% weapon; validate firing geometry & standoff first!)
-        if allow_noisy_farm and not self.pacifist and hp_frac >= 0.55:
+        # 3. Crates (300 HP -> 1 cube + 50% weapon; cap expensive standoff search to closest 3 valid crates)
+        late_block = phase in ("LATE_GAME", "FINAL_CIRCLE") and cubes >= 3
+        if allow_noisy_farm and not late_block and not self.pacifist and hp_frac >= 0.55:
+            crate_max_d = min(52.0, max_detour)
+            crate_cands: List[Tuple[float, int, Vec3]] = []
             for cr in obs.get("crates") or []:
                 cid = int(cr["id"])
                 if self.is_crate_blacklisted(cid, now):
                     continue
-                cpos = tuple(cr["pos"])
-                standoff = self.find_crate_firing_position(obs, cpos, threats, zone_center, safe_radius)
+                cpos = (float(cr["pos"][0]), float(cr["pos"][1]), float(cr["pos"][2]))
+                if on_roof:
+                    if abs(cpos[2] - z) > 4.5:
+                        continue
+                elif self.world.loaded:
+                    if (cpos[2] - self.world.terrain_height(cpos[0], cpos[1])) > 2.8:
+                        continue
+                elif abs(cpos[2] - z) > 4.5:
+                    continue
+                d_cr = math.hypot(cpos[0] - x, cpos[1] - y)
+                if d_cr > crate_max_d:
+                    continue
+                if math.hypot(cpos[0] - zone_center[0], cpos[1] - zone_center[1]) > safe_radius:
+                    continue
+                if threats.danger_at(cpos[0], cpos[1], now) > 3.2:
+                    continue
+                crate_cands.append((d_cr, cid, cpos))
+            crate_cands.sort(key=lambda item: item[0])
+            for _, cid, cpos in crate_cands[:3]:
+                standoff = self.find_crate_firing_position(
+                    obs, cpos, threats, zone_center, safe_radius, crate_id=cid
+                )
                 if standoff is None:
                     continue
-                consider("crate", cpos, cid, 64.0 + threshold_bonus * 0.5, min(52.0, max_detour), standoff=standoff)
+                consider("crate", cpos, cid, 64.0 + threshold_bonus * 0.5, crate_max_d, standoff=standoff)
 
         # 4. NPC drones (350 HP -> 2 cubes! Dual-purpose: farm when healthy & isolated)
-        if allow_noisy_farm and not self.pacifist and hp_frac >= 0.72 and not threats.visible_enemies():
+        if allow_noisy_farm and not late_block and not self.pacifist and hp_frac >= 0.72 and not threats.visible_enemies():
             for m in obs.get("mechs") or []:
                 if m.get("kind") == "npc":
                     consider("npc", tuple(m["pos"]), int(m["id"]), 70.0 + threshold_bonus, min(52.0, max_detour))
@@ -358,7 +442,8 @@ class ResourcePlanner:
                 if holder is not None and holder != me["id"] and d_drop > 35.0:
                     continue
                 if d_drop <= 105.0:
-                    bonus = 160.0 if (d_drop <= 12.0 or holder == me["id"]) else 115.0
-                    consider("drop", dpos, int(dr["id"]), bonus, 105.0)
+                    hold_or_close = (d_drop <= 12.0 or holder == me["id"])
+                    bonus = 160.0 if hold_or_close else 115.0
+                    consider("drop", dpos, int(dr["id"]), bonus, 105.0, max_danger=(6.5 if hold_or_close else 3.2))
 
         return best

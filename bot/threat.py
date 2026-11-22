@@ -2,9 +2,23 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from bot.world import Vec2, Vec3, WorldModel
+
+
+def _point_to_seg_dist_2d(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+    dx = bx - ax
+    dy = by - ay
+    l2 = dx * dx + dy * dy
+    if l2 <= 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = ((px - ax) * dx + (py - ay) * dy) / l2
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
 
 class TrackedEnemy:
@@ -18,6 +32,7 @@ class TrackedEnemy:
         "cubes",
         "weapons",
         "charging",
+        "first_seen_t",
         "last_seen_t",
         "visible_now",
     )
@@ -35,8 +50,25 @@ class TrackedEnemy:
         self.cubes: int = int(actor.get("cubes", 0))
         self.weapons: List[str] = list(actor.get("weapons") or [])
         self.charging: bool = bool(actor.get("charging", False))
+        self.first_seen_t: float = now
         self.last_seen_t: float = now
         self.visible_now: bool = True
+
+    def confidence(self, now: float) -> float:
+        if self.visible_now:
+            return 1.0
+        age = max(0.0, now - self.last_seen_t)
+        return max(0.0, 0.65 * math.exp(-age / 2.5))
+
+    def predicted_pos(self, now: float) -> Vec3:
+        if self.visible_now:
+            return self.pos
+        dt = min(1.2, max(0.0, now - self.last_seen_t))
+        return (
+            self.pos[0] + self.vel[0] * dt,
+            self.pos[1] + self.vel[1] * dt,
+            self.pos[2],
+        )
 
     def update(self, actor: Dict[str, Any], now: float) -> None:
         p = actor["pos"]
@@ -77,8 +109,8 @@ class SoundPing:
 class ThreatTracker:
     """Tracks enemy mechs, sound threats, combat timers, rear attacks, and incoming projectiles."""
 
-    MEMORY_TTL = 12.0
-    NPC_TTL = 6.0
+    MEMORY_TTL = 6.5
+    NPC_TTL = 4.5
     SOUND_TTL = 3.0
 
     def __init__(self, world: WorldModel, config: Dict[str, Any]):
@@ -120,9 +152,11 @@ class ThreatTracker:
             if kind == "npc":
                 nid = int(m["id"])
                 p = m["pos"]
+                v = m.get("vel", (0.0, 0.0, 0.0))
                 self.npcs[nid] = {
                     "id": nid,
                     "pos": (float(p[0]), float(p[1]), float(p[2])),
+                    "vel": (float(v[0]), float(v[1]), float(v[2])),
                     "hp": float(m.get("hp", 350.0)),
                     "last_seen_t": now,
                     "visible_now": True,
@@ -164,9 +198,39 @@ class ThreatTracker:
                         self.rear_alert_until_t = now + 2.2
             elif etype == "hit":
                 self.last_dealt_damage_t = now
+            elif etype == "kill":
+                killed_id = ev.get("target")
+                if killed_id is not None:
+                    kid = int(killed_id)
+                    self.enemies.pop(kid, None)
+                    self.last_hit_by.pop(kid, None)
             elif etype == "effect":
                 if ev.get("effect") == "short":
                     self.laser_short_until_t = now + self._short_s
+
+        # Prune stale attacker timestamps
+        stale_hits = [eid for eid, t in self.last_hit_by.items() if now - t > 8.0]
+        for eid in stale_hits:
+            del self.last_hit_by[eid]
+
+        # Inspect observed beams strictly for known-enemy weapon intel and close-range rear-armor alerts
+        for beam in obs.get("beams") or []:
+            b_kind = beam.get("kind")
+            if b_kind not in ("laser", "lightning"):
+                continue
+            by_raw = beam.get("by")
+            if by_raw is not None:
+                by_id = int(by_raw)
+                known = self.enemies.get(by_id)
+                if known is not None and b_kind not in known.weapons:
+                    known.weapons.append(b_kind)
+            path = beam.get("path") or []
+            if len(path) >= 2 and (by_raw is None or int(by_raw) not in self.enemies or not self.enemies[int(by_raw)].visible_now):
+                p0 = path[0]
+                p1 = path[-1]
+                if _point_to_seg_dist_2d(mx, my, float(p0[0]), float(p0[1]), float(p1[0]), float(p1[1])) <= 14.0:
+                    self.rear_alert_bearing = math.atan2(float(p0[1]) - my, float(p0[0]) - mx)
+                    self.rear_alert_until_t = max(self.rear_alert_until_t, now + 1.5)
 
         # Rolling 3s damage taken
         self._damage_events = [(t, a) for t, a in self._damage_events if now - t <= 3.0]
@@ -218,18 +282,87 @@ class ThreatTracker:
     def visible_npcs(self) -> List[Dict[str, Any]]:
         return [n for n in self.npcs.values() if n["visible_now"]]
 
+    def recent_attacker_bearing(self, my_pos: Vec3, now: float, window: float = 4.0) -> Optional[float]:
+        """World-frame bearing toward the most recent tracked attacker within `window` seconds."""
+        best_t = -1e18
+        best_b: Optional[float] = None
+        for eid, t_hit in self.last_hit_by.items():
+            if now - t_hit > window:
+                continue
+            e = self.enemies.get(eid)
+            if e is not None and t_hit > best_t:
+                best_t = t_hit
+                best_b = math.atan2(e.pos[1] - my_pos[1], e.pos[0] - my_pos[0])
+        return best_b
+
+    def multi_enemy_exposure_count(
+        self,
+        my_pos: Vec3,
+        los_fn: Optional[Callable[[TrackedEnemy], bool]] = None,
+    ) -> int:
+        """Count visible enemies within threatening reach that have clear LoS to us."""
+        mx, my, mz = my_pos
+        my_eye = (mx, my, mz + 5.0)
+        count = 0
+        for e in self.enemies.values():
+            if not e.visible_now:
+                continue
+            dist = math.hypot(e.pos[0] - mx, e.pos[1] - my)
+            is_laser_threat = (
+                "laser" in e.weapons
+                and dist < 220.0
+                and abs(math.remainder(math.atan2(my - e.pos[1], mx - e.pos[0]) - e.aim[0], math.tau)) < 0.45
+            )
+            if dist >= 125.0 and not is_laser_threat:
+                continue
+            if los_fn is not None:
+                has_los = los_fn(e)
+            elif self.world.loaded:
+                has_los = self.world.has_los((e.pos[0], e.pos[1], e.pos[2] + 7.0), my_eye, step=3.5)
+            else:
+                has_los = True
+            if has_los:
+                count += 1
+        return count
+
+    def charging_laser_threat(self, my_pos: Vec3) -> Optional[TrackedEnemy]:
+        """Return closest visible enemy currently charging a laser aimed at us with clear LoS."""
+        mx, my, mz = my_pos
+        my_eye = (mx, my, mz + 5.0)
+        best: Optional[TrackedEnemy] = None
+        best_d = 1e9
+        for e in self.enemies.values():
+            if not e.visible_now or not e.charging:
+                continue
+            dx = mx - e.pos[0]
+            dy = my - e.pos[1]
+            dist = math.hypot(dx, dy)
+            if dist >= 265.0 or dist < 1.0:
+                continue
+            err = abs(math.remainder(math.atan2(dy, dx) - e.aim[0], math.tau))
+            if err >= 0.38:
+                continue
+            if self.world.loaded and not self.world.has_los((e.pos[0], e.pos[1], e.pos[2] + 7.0), my_eye, step=3.5):
+                continue
+            if dist < best_d:
+                best_d = dist
+                best = e
+        return best
+
     def snapshot_sources(self, now: float, include_npcs: bool = False, npc_weight: float = 4.5) -> List[Tuple[float, float, float, float, float]]:
         """Compact list of (x, y, radius, r_sq, weight) for ultra-fast inline A* danger evaluation."""
         sources: List[Tuple[float, float, float, float, float]] = []
         for e in self.enemies.values():
-            age = max(0.0, now - e.last_seen_t)
-            decay = 1.0 if e.visible_now else max(0.15, 1.0 - age / self.MEMORY_TTL)
+            conf = e.confidence(now)
+            if conf < 0.05:
+                continue
+            epos = e.predicted_pos(now)
             mult = 1.0 + 0.05 * min(e.cubes, 10)
             if e.charging:
                 mult *= 1.4
-            sources.append((e.pos[0], e.pos[1], 160.0, 25600.0, decay * mult * 6.0))
+            sources.append((epos[0], epos[1], 160.0, 25600.0, conf * mult * 6.0))
             if "lightning" in e.weapons:
-                sources.append((e.pos[0], e.pos[1], 55.0, 3025.0, decay * 4.5))
+                sources.append((epos[0], epos[1], 55.0, 3025.0, conf * 4.5))
         if include_npcs:
             for n in self.npcs.values():
                 age = max(0.0, now - n["last_seen_t"])
@@ -239,29 +372,31 @@ class ThreatTracker:
             age = max(0.0, now - s.t)
             decay = max(0.0, 1.0 - age / self.SOUND_TTL)
             if decay > 0.05:
-                sources.append((s.x, s.y, 120.0, 14400.0, decay * s.weight * 1.2))
+                sources.append((s.x, s.y, 120.0, 14400.0, decay * s.weight * 0.85))
         return sources
 
     def danger_at(self, x: float, y: float, now: float, include_npcs: bool = False, npc_weight: float = 4.0) -> float:
         """Non-negative threat penalty for A* routing and safe-position scoring."""
         score = 0.0
         for e in self.enemies.values():
-            dx = e.pos[0] - x
-            dy = e.pos[1] - y
+            conf = e.confidence(now)
+            if conf < 0.05:
+                continue
+            epos = e.predicted_pos(now)
+            dx = epos[0] - x
+            dy = epos[1] - y
             if dx > 160.0 or dx < -160.0 or dy > 160.0 or dy < -160.0:
                 continue
             d2 = dx * dx + dy * dy
             if d2 < 25600.0:
                 d = math.sqrt(d2)
-                age = max(0.0, now - e.last_seen_t)
-                decay = 1.0 if e.visible_now else max(0.15, 1.0 - age / self.MEMORY_TTL)
                 prox = (160.0 - d) / 160.0
                 mult = 1.0 + 0.05 * min(e.cubes, 10)
                 if "lightning" in e.weapons and d < 55.0:
                     mult *= 1.5
                 if e.charging and d < 180.0:
                     mult *= 1.4
-                score += decay * mult * (prox * prox) * 6.0
+                score += conf * mult * (prox * prox) * 6.0
 
         if include_npcs:
             for n in self.npcs.values():
@@ -288,7 +423,7 @@ class ThreatTracker:
                 age = max(0.0, now - s.t)
                 decay = max(0.0, 1.0 - age / self.SOUND_TTL)
                 prox = (120.0 - d) / 120.0
-                score += decay * s.weight * (prox * prox) * 1.2
+                score += decay * s.weight * (prox * prox) * 0.85
         return score
 
     def compute_dodge_vector(
@@ -348,6 +483,11 @@ class ThreatTracker:
             else:
                 px_dir, py_dir = perp2_x, perp2_y
 
+            if self.world.loaded and self.world.is_blocked_at(mx + px_dir * 5.5, my + py_dir * 5.5, mz, clearance=0.3):
+                alt_x, alt_y = -px_dir, -py_dir
+                if not self.world.is_blocked_at(mx + alt_x * 5.5, my + alt_y * 5.5, mz, clearance=0.3):
+                    px_dir, py_dir = alt_x, alt_y
+
             w = (2.5 if kind == "mortar" else 1.4) * (1.0 - t_ca / 1.3)
             dodge_x += px_dir * w
             dodge_y += py_dir * w
@@ -370,6 +510,9 @@ class ThreatTracker:
                 zc_dot = (zone_center[0] - mx) * perp1_x + (zone_center[1] - my) * perp1_y
                 if zc_dot < 0:
                     perp1_x, perp1_y = -perp1_x, -perp1_y
+                if self.world.loaded and self.world.is_blocked_at(mx + perp1_x * 5.5, my + perp1_y * 5.5, mz, clearance=0.3):
+                    if not self.world.is_blocked_at(mx - perp1_x * 5.5, my - perp1_y * 5.5, mz, clearance=0.3):
+                        perp1_x, perp1_y = -perp1_x, -perp1_y
                 dodge_x += perp1_x * 2.2
                 dodge_y += perp1_y * 2.2
                 urgency = max(urgency, 2.2)

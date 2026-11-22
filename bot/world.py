@@ -175,6 +175,9 @@ class WorldModel:
         self.walkable: bytearray = bytearray()
         self.cover_adj: bytearray = bytearray()
         self.escape_deg: bytearray = bytearray()
+        self.cell_z: array.array = array.array("f")
+        self.elev_adv: array.array = array.array("f")
+        self.narrow_choke: bytearray = bytearray()
 
         if map_dir:
             self.load(map_dir)
@@ -347,6 +350,9 @@ class WorldModel:
         walkable = bytearray(total)
         cover_adj = bytearray(total)
         escape_deg = bytearray(total)
+        cell_z = array.array("f", [0.0]) * total
+        elev_adv = array.array("f", [0.0]) * total
+        narrow_choke = bytearray(total)
 
         half = cell * 0.5
         # tan(48 deg) ~= 1.1106 -> 3.33m over 3m = 333 int16 cm
@@ -377,37 +383,74 @@ class WorldModel:
                         ):
                             continue
                 walkable[row + gx] = 1
+                cell_z[row + gx] = self.terrain_height(cx, cy)
 
-        # Mark cells adjacent to solid obstacles and compute 8-neighbor escape degree (dead-end detection)
+        # Mark cells adjacent to solid obstacles, narrow chokes, and 8-neighbor escape degree
         nx = self.nav_nx
-        for gy in range(1, self.nav_ny - 1):
+        ny = self.nav_ny
+        for gy in range(1, ny - 1):
             row = gy * nx
             for gx in range(1, nx - 1):
                 idx = row + gx
                 if not walkable[idx]:
                     continue
+                w_l = walkable[idx - 1]
+                w_r = walkable[idx + 1]
+                w_d = walkable[idx - nx]
+                w_u = walkable[idx + nx]
                 deg = (
-                    walkable[idx - 1]
-                    + walkable[idx + 1]
-                    + walkable[idx - nx]
-                    + walkable[idx + nx]
+                    w_l
+                    + w_r
+                    + w_d
+                    + w_u
                     + walkable[idx - nx - 1]
                     + walkable[idx - nx + 1]
                     + walkable[idx + nx - 1]
                     + walkable[idx + nx + 1]
                 )
                 escape_deg[idx] = deg
-                if (
-                    not walkable[idx - 1]
-                    or not walkable[idx + 1]
-                    or not walkable[idx - nx]
-                    or not walkable[idx + nx]
-                ):
+                if not w_l or not w_r or not w_d or not w_u:
                     cover_adj[idx] = 1
+                if deg <= 2 or (not w_l and not w_r) or (not w_d and not w_u):
+                    narrow_choke[idx] = 1
+
+        # Compute local elevation advantage relative to surrounding walkable terrain
+        offsets = (
+            (2, 0), (-2, 0), (0, 2), (0, -2),
+            (4, 0), (-4, 0), (0, 4), (0, -4),
+            (3, 3), (3, -3), (-3, 3), (-3, -3),
+        )
+        for gy in range(ny):
+            row = gy * nx
+            for gx in range(nx):
+                idx = row + gx
+                if not walkable[idx]:
+                    continue
+                z0 = cell_z[idx]
+                acc = 0.0
+                cnt = 0
+                for dx, dy in offsets:
+                    sx = gx + dx
+                    sy = gy + dy
+                    if 0 <= sx < nx and 0 <= sy < ny:
+                        sidx = sy * nx + sx
+                        if walkable[sidx]:
+                            acc += cell_z[sidx]
+                            cnt += 1
+                if cnt > 0:
+                    adv = z0 - (acc / cnt)
+                    if adv < -6.0:
+                        adv = -6.0
+                    elif adv > 8.0:
+                        adv = 8.0
+                    elev_adv[idx] = adv
 
         self.walkable = walkable
         self.cover_adj = cover_adj
         self.escape_deg = escape_deg
+        self.cell_z = cell_z
+        self.elev_adv = elev_adv
+        self.narrow_choke = narrow_choke
 
     def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
         gx = int((x - self.nav_min_x) / self.NAV_CELL)
@@ -432,6 +475,34 @@ class WorldModel:
         if gx < 0 or gx >= self.nav_nx or gy < 0 or gy >= self.nav_ny:
             return False
         return bool(self.walkable[gy * self.nav_nx + gx])
+
+    def cell_elevation_advantage(self, gx: int, gy: int) -> float:
+        """O(1) local terrain elevation advantage at navgrid cell (gx, gy)."""
+        if not self.elev_adv or gx < 0 or gx >= self.nav_nx or gy < 0 or gy >= self.nav_ny:
+            return 0.0
+        return float(self.elev_adv[gy * self.nav_nx + gx])
+
+    def is_narrow_choke(self, gx: int, gy: int) -> bool:
+        """O(1) check whether navgrid cell (gx, gy) is a narrow choke or dead-end."""
+        if not self.narrow_choke or gx < 0 or gx >= self.nav_nx or gy < 0 or gy >= self.nav_ny:
+            return False
+        return bool(self.narrow_choke[gy * self.nav_nx + gx])
+
+    def has_cover_within(self, gx: int, gy: int, ring: int = 2) -> bool:
+        """True if any walkable cover_adj cell exists within +/- `ring` navgrid cells."""
+        if not self.loaded or not self.cover_adj:
+            return False
+        y0 = max(0, gy - ring)
+        y1 = min(self.nav_ny - 1, gy + ring)
+        x0 = max(0, gx - ring)
+        x1 = min(self.nav_nx - 1, gx + ring)
+        nx = self.nav_nx
+        for yy in range(y0, y1 + 1):
+            row = yy * nx
+            for xx in range(x0, x1 + 1):
+                if self.walkable[row + xx] and self.cover_adj[row + xx]:
+                    return True
+        return False
 
     def nearest_walkable_cell(self, x: float, y: float, max_ring: int = 8) -> Tuple[int, int]:
         gx, gy = self.world_to_grid(x, y)
@@ -573,7 +644,10 @@ class WorldModel:
                 sep_gain = d_threat - cur_d_threat
                 deg = self.escape_deg[row + gx]
                 corner_bonus = 12.0 if 4 <= deg <= 6 else (-28.0 if deg <= 2 else 0.0)
-                score = sep_gain * 1.15 + d_threat * 0.35 - d_me * 0.55 + corner_bonus
+                if self.narrow_choke and self.narrow_choke[row + gx] and deg > 2:
+                    corner_bonus -= 16.0
+                elev_bonus = max(-3.0, min(6.0, self.elev_adv[row + gx] * 1.2)) if self.elev_adv else 0.0
+                score = sep_gain * 1.15 + d_threat * 0.35 - d_me * 0.55 + corner_bonus + elev_bonus
                 candidates.append((score, wx, wy, deg))
 
         if not candidates:
@@ -601,3 +675,107 @@ class WorldModel:
             my_pos, threat_pos, zone_center, zone_radius, search_radius=search_radius, max_results=1
         )
         return cands[0][0] if cands else None
+
+    def find_fast_los_break(
+        self,
+        my_pos: Vec3,
+        threat_pos: Vec3,
+        zone_center: Vec2,
+        zone_radius: float,
+        max_dist: float = 22.0,
+    ) -> Optional[Vec2]:
+        """Return the closest walkable cover cell within `max_dist` that breaks LoS from `threat_pos`."""
+        if not self.loaded:
+            return None
+        mx, my, _ = my_pos
+        tx, ty, tz = threat_pos
+        t_eye = (tx, ty, tz + 7.5)
+        gx0, gy0 = self.world_to_grid(mx, my)
+        r_cells = max(2, int(max_dist / self.NAV_CELL))
+        zcx, zcy = zone_center
+        safe_r2 = max(4.0, zone_radius - 3.0) ** 2
+
+        cands: List[Tuple[float, float, float]] = []
+        for dy in range(-r_cells, r_cells + 1):
+            gy = gy0 + dy
+            if gy < 0 or gy >= self.nav_ny:
+                continue
+            row = gy * self.nav_nx
+            for dx in range(-r_cells, r_cells + 1):
+                gx = gx0 + dx
+                if gx < 0 or gx >= self.nav_nx:
+                    continue
+                idx = row + gx
+                if not self.walkable[idx] or not self.cover_adj[idx]:
+                    continue
+                wx, wy = self.grid_to_world(gx, gy)
+                if (wx - zcx) ** 2 + (wy - zcy) ** 2 > safe_r2:
+                    continue
+                d_me = math.hypot(wx - mx, wy - my)
+                if d_me < 2.0 or d_me > max_dist:
+                    continue
+                deg = self.escape_deg[idx] if self.escape_deg else 6
+                cost = d_me + (10.0 if deg <= 2 else 0.0)
+                if not self.line_walkable(mx, my, wx, wy):
+                    cost += 18.0
+                cands.append((cost, wx, wy))
+
+        if not cands:
+            return None
+        cands.sort(key=lambda c: c[0])
+        for _, wx, wy in cands[:8]:
+            wz = self.terrain_height(wx, wy)
+            if not self.has_los(t_eye, (wx, wy, wz + 5.0), step=3.5):
+                return (wx, wy)
+        return None
+
+    def find_nearest_combat_cover(
+        self,
+        my_pos: Vec3,
+        target_pos: Vec3,
+        zone_center: Vec2,
+        zone_radius: float,
+        search_radius: float = 34.0,
+    ) -> Optional[Vec2]:
+        """Find a nearby multi-escape cover corner that keeps LoS to `target_pos` for corner-peeking fights."""
+        if not self.loaded:
+            return None
+        mx, my, _ = my_pos
+        t_center = (target_pos[0], target_pos[1], target_pos[2] + 4.5)
+        gx0, gy0 = self.world_to_grid(mx, my)
+        r_cells = max(2, int(search_radius / self.NAV_CELL))
+        zcx, zcy = zone_center
+        safe_r2 = max(4.0, zone_radius - 5.0) ** 2
+
+        cands: List[Tuple[float, float, float]] = []
+        for dy in range(-r_cells, r_cells + 1):
+            gy = gy0 + dy
+            if gy < 0 or gy >= self.nav_ny:
+                continue
+            row = gy * self.nav_nx
+            for dx in range(-r_cells, r_cells + 1):
+                gx = gx0 + dx
+                if gx < 0 or gx >= self.nav_nx:
+                    continue
+                idx = row + gx
+                if not self.walkable[idx] or not self.cover_adj[idx]:
+                    continue
+                deg = self.escape_deg[idx] if self.escape_deg else 6
+                if deg < 4 or deg > 6:
+                    continue
+                wx, wy = self.grid_to_world(gx, gy)
+                if (wx - zcx) ** 2 + (wy - zcy) ** 2 > safe_r2:
+                    continue
+                d_me = math.hypot(wx - mx, wy - my)
+                if d_me < 3.5 or d_me > search_radius:
+                    continue
+                cands.append((d_me, wx, wy))
+
+        if not cands:
+            return None
+        cands.sort(key=lambda c: c[0])
+        for _, wx, wy in cands[:6]:
+            wz = self.terrain_height(wx, wy)
+            if self.has_los((wx, wy, wz + 7.0), t_center, step=3.5):
+                return (wx, wy)
+        return None

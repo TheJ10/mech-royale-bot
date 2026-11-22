@@ -18,7 +18,7 @@ from bot.world import WorldModel
 
 
 class MechBot:
-    """Unified Battle Intelligence autonomous Mech Royale bot (UBI-v2)."""
+    """Project Overdrive autonomous Mech Royale bot (overdrive-v5)."""
 
     profile_name = os.environ.get("MECH_PROFILE", "unified")
     name = PROFILES.get(profile_name, PROFILES["unified"]).bot_name
@@ -47,6 +47,7 @@ class MechBot:
             self.combat,
             self.resources,
             self.profile,
+            seed=int(hello.get("seed", 0)),
         )
         self.telemetry = DecisionTelemetry(trace_path=trace_path)
         if self.telemetry.file_enabled:

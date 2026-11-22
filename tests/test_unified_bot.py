@@ -1,4 +1,4 @@
-"""Unit and integration tests for Unified Battle Intelligence (UBI-v1) decision engine and telemetry."""
+"""Unit and integration tests for Project Overdrive (overdrive-v5) decision engine and telemetry."""
 from __future__ import annotations
 
 import json
@@ -19,7 +19,7 @@ class TestUnifiedBattleIntelligence(unittest.TestCase):
         self.bot = MechBot(make_hello(ARENA_DIR))
 
     def test_01_bot_name_and_unified_profile(self):
-        self.assertEqual(self.bot.name, "ubi-v2")
+        self.assertEqual(self.bot.name, "overdrive-v5")
         self.assertEqual(self.bot.profile.name, "unified")
         self.assertFalse(self.bot.profile.pacifist)
 
@@ -303,6 +303,174 @@ class TestUnifiedBattleIntelligence(unittest.TestCase):
             self.assertEqual(first["selected_objective"], "RETREAT_HEAL")
             self.assertAlmostEqual(first["consequence"]["retreat_sep_delta"], 14.0, places=1)
             self.assertFalse(first["consequence"]["retreat_los_broken"])
+
+    # --- Project Overdrive (overdrive-v5) Architecture & Regression Tests ---
+
+    def test_22_kill_event_prunes_enemy_and_zeroes_danger(self):
+        bot = MechBot(make_hello())
+        enemy = {
+            "id": 14, "kind": "mech", "pos": [20.0, 0.0, 0.0], "vel": [0, 0, 0],
+            "aim": [math.pi, 0], "hp": 40.0, "max_hp": 1400.0, "cubes": 3, "weapons": ["gun"],
+        }
+        bot.act(make_obs(tick=100, t=10.0, pos=[0.0, 0.0, 0.0], mechs=[enemy]))
+        self.assertIn(14, bot.threats.enemies)
+        self.assertGreater(bot.threats.danger_at(20.0, 0.0, 10.0), 0.5)
+
+        cube = {"id": 5099, "pos": [20.0, 0.0, 0.0]}
+        bot.act(make_obs(
+            tick=102, t=10.1, pos=[0.0, 0.0, 0.0],
+            mechs=[], cubes=[cube],
+            events=[{"type": "kill", "target": 14}],
+        ))
+        self.assertNotIn(14, bot.threats.enemies)
+        self.assertEqual(bot.threats.danger_at(20.0, 0.0, 10.1), 0.0)
+        self.assertEqual(bot.strategy.mode, "LOOT_CUBE")
+
+    def test_23_beams_never_inject_phantom_enemies_and_close_beam_sets_rear_alert(self):
+        bot = MechBot(make_hello())
+        obs = make_obs(tick=100, t=10.0, pos=[0.0, 0.0, 0.0], aim=[0.0, 0.0])
+        obs["beams"] = [
+            {"by": 9, "kind": "laser", "path": [[-80.0, 50.0, 7.0], [-40.0, 50.0, 7.0]], "age": 0.1}
+        ]
+        bot.act(obs)
+        self.assertEqual(len(bot.threats.enemies), 0)
+        self.assertEqual(bot.threats.danger_at(-60.0, 50.0, 10.0), 0.0)
+        self.assertIsNone(bot.threats.rear_alert_bearing)
+
+        obs2 = make_obs(tick=102, t=10.1, pos=[0.0, 0.0, 0.0], aim=[0.0, 0.0])
+        obs2["beams"] = [
+            {"by": 9, "kind": "laser", "path": [[-50.0, 2.0, 7.0], [10.0, 2.0, 7.0]], "age": 0.1}
+        ]
+        bot.act(obs2)
+        self.assertEqual(len(bot.threats.enemies), 0)
+        self.assertIsNotNone(bot.threats.rear_alert_bearing)
+
+    def test_24_zero_delay_dual_fire_gun_laser_and_velocity_led_lightning(self):
+        bot = MechBot(make_hello())
+        weapons_laser = [
+            {"kind": "gun", "cooldown": 0.0, "ammo": 10, "reload": 0.0, "stats": {"damage": 45, "cooldown": 0.24, "speed": 252, "range": 230, "mag": 12, "reload": 2.4}},
+            {"kind": "laser", "cooldown": 0.0, "charge": 0.25, "stats": {"damage": 315, "charge": 0.75, "min_charge": 0.15, "hold_s": 2.0, "cooldown": 1.65, "range": 280}},
+        ]
+        # Enemy moving slowly so hitscan_aim and gun_lead are both within gun tol -> fires BOTH with aim locked on hitscan_aim
+        e_mid = {"id": 5, "kind": "mech", "pos": [100.0, 0.0, 0.0], "vel": [0.0, 3.0, 0.0], "aim": [math.pi, 0.0], "hp": 1000.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"]}
+        obs_l = make_obs(tick=100, t=10.0, pos=[0.0, 0.0, 0.0], aim=[0.0, -0.02], weapons=weapons_laser, mechs=[e_mid])
+        act_l = bot.act(obs_l)
+        self.assertEqual(act_l["fire"], [True, True], "Should dual-fire gun while laser is charging")
+        self.assertAlmostEqual(act_l["aim"][0], math.atan2(3.0 * 0.05, 100.0), places=3, msg="Aim must stay locked on hitscan intercept")
+
+        weapons_light = [
+            {"kind": "gun", "cooldown": 0.0, "ammo": 10, "reload": 0.0, "stats": {"damage": 45, "cooldown": 0.24, "speed": 252, "range": 230, "mag": 12, "reload": 2.4}},
+            {"kind": "lightning", "cooldown": 0.0, "stats": {"damage": 60, "cooldown": 0.25, "range": 45, "cone_deg": 30, "energy": 3}},
+        ]
+        e_close = {"id": 6, "kind": "mech", "pos": [30.0, 0.0, 0.0], "vel": [0.0, 18.0, 0.0], "aim": [math.pi, 0.0], "hp": 1000.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"]}
+        obs_lt = make_obs(tick=104, t=10.2, pos=[0.0, 0.0, 0.0], aim=[0.0, -0.08], weapons=weapons_light, mechs=[e_close])
+        act_lt = bot.act(obs_lt)
+        self.assertEqual(act_lt["fire"], [True, True])
+        self.assertGreater(act_lt["aim"][0], 0.005, "Gun+lightning close dual-fire should apply velocity lead")
+
+    def test_25_anti_laser_duck_breaks_los_with_boost(self):
+        bot = MechBot(make_hello())
+        wall = Prism("building", -20.0, 30.0, [-14.0, -25.0, -6.0, -25.0, -6.0, -4.0, -14.0, -4.0], [])
+        bot.world.load_synthetic((-120.0, 120.0, -120.0, 120.0), [wall], flat_z=0.0)
+        sniper = {
+            "id": 21, "kind": "mech", "pos": [90.0, 0.0, 0.0], "vel": [0.0, 0.0, 0.0],
+            "aim": [math.pi, 0.0], "hp": 1400.0, "max_hp": 1400.0, "cubes": 0,
+            "weapons": ["gun", "laser"], "charging": True,
+        }
+        obs = make_obs(tick=200, t=20.0, pos=[0.0, 0.0, 0.0], aim=[0.0, 0.0], hp=1100.0, energy=80.0, mechs=[sniper])
+        act = bot.act(obs)
+        self.assertEqual(bot.strategy.mode, "ANTI_LASER_DUCK")
+        self.assertTrue(act["boost"])
+        gx, gy = bot.strategy.last_decision_meta["goal"]
+        self.assertFalse(bot.world.has_los((90.0, 0.0, 7.5), (gx, gy, 5.0), step=3.5))
+
+        # If already charging a laser while ducking >7m to cover, cancel/release charge to restore full sprint speed
+        weapons_charging = [
+            {"kind": "gun", "cooldown": 0.0, "ammo": 10, "reload": 0.0, "stats": {"damage": 45, "cooldown": 0.24, "speed": 252, "range": 230, "mag": 12, "reload": 2.4}},
+            {"kind": "laser", "cooldown": 0.0, "charge": 0.25, "stats": {"damage": 315, "charge": 0.75, "min_charge": 0.15, "hold_s": 2.0, "cooldown": 1.65, "range": 280}},
+        ]
+        obs_chg = make_obs(tick=202, t=20.1, pos=[0.0, 0.0, 0.0], aim=[0.0, 0.0], hp=1100.0, energy=80.0, weapons=weapons_charging, mechs=[sniper])
+        act_chg = bot.act(obs_chg)
+        self.assertEqual(bot.strategy.mode, "ANTI_LASER_DUCK")
+        self.assertFalse(act_chg["fire"][1], "Must release/cancel half-speed laser charge when sprinting >7m to duck sniper")
+
+    def test_26_surgical_regen_discipline(self):
+        bot = MechBot(make_hello())
+        # Last combat 4.0s ago, HP at ~66% (above bad_duel 65%, below 72% regen threshold), enemy far at 110m healthy -> hold fire
+        far_e = {"id": 31, "kind": "mech", "pos": [110.0, 0.0, 0.0], "vel": [0, 0, 0], "aim": [math.pi, 0], "hp": 1200.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"]}
+        bot.threats.last_damaged_t = 6.0
+        obs_far = make_obs(tick=100, t=10.0, pos=[0.0, 0.0, 0.0], aim=[0.0, 0.0], hp=920.0, mechs=[far_e])
+        act_far = bot.act(obs_far)
+        self.assertFalse(any(act_far["fire"]), "Should hold fire on distant healthy enemy to keep regen timer")
+
+        # Enemy closes to 50m -> MUST fight immediately
+        close_e = {"id": 31, "kind": "mech", "pos": [50.0, 0.0, 0.0], "vel": [0, 0, 0], "aim": [math.pi, 0], "hp": 1200.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"]}
+        obs_close = make_obs(tick=102, t=10.1, pos=[0.0, 0.0, 0.0], aim=[0.0, -0.05], hp=920.0, mechs=[close_e])
+        act_close = bot.act(obs_close)
+        self.assertTrue(act_close["fire"][0], "Must engage close threat even while regenerating")
+
+    def test_27_target_hysteresis_and_defensive_drop_hold(self):
+        bot = MechBot(make_hello())
+        e1 = {"id": 1, "kind": "mech", "pos": [70.0, 0.0, 0.0], "vel": [0, 0, 0], "aim": [0.0, 0.0], "hp": 900.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"]}
+        e2 = {"id": 2, "kind": "mech", "pos": [0.0, 68.0, 0.0], "vel": [0, 0, 0], "aim": [math.pi / 2, 0.0], "hp": 900.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"]}
+        obs1 = make_obs(tick=100, t=10.0, pos=[0.0, 0.0, 0.0], aim=[0.0, 0.0], mechs=[e1])
+        bot.threats.update(obs1)
+        self.assertEqual(bot.combat.select_mech_target(obs1, bot.threats).id, 1)
+
+        obs_tie = make_obs(tick=102, t=10.1, pos=[0.0, 0.0, 0.0], aim=[0.0, 0.0], mechs=[e1, e2])
+        bot.threats.update(obs_tie)
+        self.assertEqual(bot.combat.select_mech_target(obs_tie, bot.threats).id, 1)
+
+        e2_close = {"id": 2, "kind": "mech", "pos": [0.0, 35.0, 0.0], "vel": [0, 0, 0], "aim": [-math.pi / 2, 0.0], "hp": 900.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"]}
+        obs_atk = make_obs(
+            tick=104, t=10.2, pos=[0.0, 0.0, 0.0], aim=[0.0, 0.0], mechs=[e1, e2_close],
+            events=[{"type": "damaged", "amount": 45, "weapon": "gun", "bearing": math.pi / 2, "by": 2}],
+        )
+        bot.threats.update(obs_atk)
+        self.assertEqual(bot.combat.select_mech_target(obs_atk, bot.threats).id, 2)
+
+        bot2 = MechBot(make_hello())
+        drop = {"id": 20001, "pos": [2.0, 0.0, 0.0], "radius": 8.0, "lands_in": 0.0, "capture_s": 4.0, "progress": 1.5, "holder": 0}
+        challenger = {"id": 3, "kind": "mech", "pos": [45.0, 0.0, 0.0], "vel": [0, 0, 0], "aim": [math.pi, 0], "hp": 1000.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"]}
+        act_d = bot2.act(make_obs(tick=200, t=20.0, pos=[0.0, 0.0, 0.0], aim=[0.0, -0.05], mechs=[challenger], drops=[drop]))
+        self.assertEqual(bot2.strategy.mode, "LOOT_DROP")
+        self.assertTrue(act_d["fire"][0])
+
+    def test_28_phase_weapon_swap_upgrades_and_crate_cache(self):
+        bot = MechBot(make_hello())
+        weapons_laser = [
+            {"kind": "gun", "cooldown": 0.0, "ammo": 12, "reload": 0.0, "stats": {}},
+            {"kind": "laser", "cooldown": 0.0, "charge": 0.0, "stats": {}},
+        ]
+        light_pickup = {"id": 8050, "kind": "lightning", "pos": [1.0, 0.0, 0.0]}
+        obs_mid = make_obs(tick=300, t=30.0, pos=[0.0, 0.0, 0.0], weapons=weapons_laser, pickups=[light_pickup])
+        self.assertEqual(bot.resources.choose_weapon_take(obs_mid, phase="MID_GAME"), (None, None))
+        self.assertEqual(bot.resources.choose_weapon_take(obs_mid, phase="LATE_GAME"), (8050, 1))
+
+        offer = {
+            "id": 1, "expires": 35.0,
+            "choices": [
+                {"id": "reactor", "name": "Reactor", "desc": ""},
+                {"id": "laser_charge", "name": "Capacitor", "desc": ""},
+            ],
+        }
+        obs_up = make_obs(tick=302, t=30.1, weapons=weapons_laser, offer=offer)
+        self.assertEqual(bot.resources.choose_upgrade(obs_up, phase="MID_GAME"), 1)
+
+        pt1 = bot.resources.find_crate_firing_position(obs_mid, (2.0, 0.0, 0.0), bot.threats, (0.0, 0.0), 400.0, crate_id=1010)
+        self.assertIsNotNone(pt1)
+        self.assertIn(1010, bot.resources._crate_standoff_cache)
+
+    def test_29_proactive_zone_advance_before_urgent(self):
+        bot = MechBot(make_hello())
+        zone = {
+            "center": [0.0, 0.0], "radius": 400.0,
+            "next_center": [250.0, 0.0], "next_radius": 140.0,
+            "shrink_start": 120.0, "shrink_end": 160.0, "dps": 35.0,
+        }
+        obs_adv = make_obs(tick=1000, t=95.0, pos=[0.0, 0.0, 0.0], in_zone=True, zone=zone)
+        bot.act(obs_adv)
+        self.assertEqual(bot.strategy.mode, "ZONE_ADVANCE")
 
 
 if __name__ == "__main__":
