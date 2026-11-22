@@ -175,6 +175,9 @@ class WorldModel:
         self.walkable: bytearray = bytearray()
         self.cover_adj: bytearray = bytearray()
         self.escape_deg: bytearray = bytearray()
+        self.cell_z: array.array = array.array("f")
+        self.elev_adv: array.array = array.array("f")
+        self.narrow_choke: bytearray = bytearray()
 
         if map_dir:
             self.load(map_dir)
@@ -347,6 +350,9 @@ class WorldModel:
         walkable = bytearray(total)
         cover_adj = bytearray(total)
         escape_deg = bytearray(total)
+        cell_z = array.array("f", [0.0]) * total
+        elev_adv = array.array("f", [0.0]) * total
+        narrow_choke = bytearray(total)
 
         half = cell * 0.5
         # tan(48 deg) ~= 1.1106 -> 3.33m over 3m = 333 int16 cm
@@ -377,37 +383,74 @@ class WorldModel:
                         ):
                             continue
                 walkable[row + gx] = 1
+                cell_z[row + gx] = self.terrain_height(cx, cy)
 
-        # Mark cells adjacent to solid obstacles and compute 8-neighbor escape degree (dead-end detection)
+        # Mark cells adjacent to solid obstacles, narrow chokes, and 8-neighbor escape degree
         nx = self.nav_nx
-        for gy in range(1, self.nav_ny - 1):
+        ny = self.nav_ny
+        for gy in range(1, ny - 1):
             row = gy * nx
             for gx in range(1, nx - 1):
                 idx = row + gx
                 if not walkable[idx]:
                     continue
+                w_l = walkable[idx - 1]
+                w_r = walkable[idx + 1]
+                w_d = walkable[idx - nx]
+                w_u = walkable[idx + nx]
                 deg = (
-                    walkable[idx - 1]
-                    + walkable[idx + 1]
-                    + walkable[idx - nx]
-                    + walkable[idx + nx]
+                    w_l
+                    + w_r
+                    + w_d
+                    + w_u
                     + walkable[idx - nx - 1]
                     + walkable[idx - nx + 1]
                     + walkable[idx + nx - 1]
                     + walkable[idx + nx + 1]
                 )
                 escape_deg[idx] = deg
-                if (
-                    not walkable[idx - 1]
-                    or not walkable[idx + 1]
-                    or not walkable[idx - nx]
-                    or not walkable[idx + nx]
-                ):
+                if not w_l or not w_r or not w_d or not w_u:
                     cover_adj[idx] = 1
+                if deg <= 2 or (not w_l and not w_r) or (not w_d and not w_u):
+                    narrow_choke[idx] = 1
+
+        # Compute local elevation advantage relative to surrounding walkable terrain
+        offsets = (
+            (2, 0), (-2, 0), (0, 2), (0, -2),
+            (4, 0), (-4, 0), (0, 4), (0, -4),
+            (3, 3), (3, -3), (-3, 3), (-3, -3),
+        )
+        for gy in range(ny):
+            row = gy * nx
+            for gx in range(nx):
+                idx = row + gx
+                if not walkable[idx]:
+                    continue
+                z0 = cell_z[idx]
+                acc = 0.0
+                cnt = 0
+                for dx, dy in offsets:
+                    sx = gx + dx
+                    sy = gy + dy
+                    if 0 <= sx < nx and 0 <= sy < ny:
+                        sidx = sy * nx + sx
+                        if walkable[sidx]:
+                            acc += cell_z[sidx]
+                            cnt += 1
+                if cnt > 0:
+                    adv = z0 - (acc / cnt)
+                    if adv < -6.0:
+                        adv = -6.0
+                    elif adv > 8.0:
+                        adv = 8.0
+                    elev_adv[idx] = adv
 
         self.walkable = walkable
         self.cover_adj = cover_adj
         self.escape_deg = escape_deg
+        self.cell_z = cell_z
+        self.elev_adv = elev_adv
+        self.narrow_choke = narrow_choke
 
     def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
         gx = int((x - self.nav_min_x) / self.NAV_CELL)
@@ -432,6 +475,18 @@ class WorldModel:
         if gx < 0 or gx >= self.nav_nx or gy < 0 or gy >= self.nav_ny:
             return False
         return bool(self.walkable[gy * self.nav_nx + gx])
+
+    def cell_elevation_advantage(self, gx: int, gy: int) -> float:
+        """O(1) local terrain elevation advantage at navgrid cell (gx, gy)."""
+        if not self.elev_adv or gx < 0 or gx >= self.nav_nx or gy < 0 or gy >= self.nav_ny:
+            return 0.0
+        return float(self.elev_adv[gy * self.nav_nx + gx])
+
+    def is_narrow_choke(self, gx: int, gy: int) -> bool:
+        """O(1) check whether navgrid cell (gx, gy) is a narrow choke or dead-end."""
+        if not self.narrow_choke or gx < 0 or gx >= self.nav_nx or gy < 0 or gy >= self.nav_ny:
+            return False
+        return bool(self.narrow_choke[gy * self.nav_nx + gx])
 
     def nearest_walkable_cell(self, x: float, y: float, max_ring: int = 8) -> Tuple[int, int]:
         gx, gy = self.world_to_grid(x, y)
@@ -573,7 +628,10 @@ class WorldModel:
                 sep_gain = d_threat - cur_d_threat
                 deg = self.escape_deg[row + gx]
                 corner_bonus = 12.0 if 4 <= deg <= 6 else (-28.0 if deg <= 2 else 0.0)
-                score = sep_gain * 1.15 + d_threat * 0.35 - d_me * 0.55 + corner_bonus
+                if self.narrow_choke and self.narrow_choke[row + gx] and deg > 2:
+                    corner_bonus -= 16.0
+                elev_bonus = max(-3.0, min(6.0, self.elev_adv[row + gx] * 1.2)) if self.elev_adv else 0.0
+                score = sep_gain * 1.15 + d_threat * 0.35 - d_me * 0.55 + corner_bonus + elev_bonus
                 candidates.append((score, wx, wy, deg))
 
         if not candidates:

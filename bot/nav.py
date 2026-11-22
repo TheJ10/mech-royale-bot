@@ -61,6 +61,7 @@ class Navigator:
         nx = self.world.nav_nx
         ny = self.world.nav_ny
         walkable = self.world.walkable
+        narrow_choke = self.world.narrow_choke
         cell = self.world.NAV_CELL
         min_x = self.world.nav_min_x
         min_y = self.world.nav_min_y
@@ -133,7 +134,8 @@ class Navigator:
                         danger_cache[n_idx] = cached
                     extra = cached
 
-                tentative_g = cur_g + step_cost + extra
+                choke_pen = 0.75 if (narrow_choke and narrow_choke[n_idx]) else 0.0
+                tentative_g = cur_g + step_cost + extra + choke_pen
                 prev_g = g_score.get(n_idx)
                 if prev_g is None or tentative_g < prev_g:
                     g_score[n_idx] = tentative_g

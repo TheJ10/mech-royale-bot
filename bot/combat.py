@@ -29,6 +29,8 @@ def solve_lead_point(
     proj_speed: float,
     max_lead_s: float = 1.1,
     gravity: float = 22.0,
+    shot_offset: float = 3.0,
+    min_z: Optional[float] = None,
 ) -> Vec3:
     """Iterative 3D projectile intercept point with gravity correction for jumping/falling targets."""
     tx, ty, tz = target_pos
@@ -40,11 +42,14 @@ def solve_lead_point(
         py = ty + vy * t
         pz = tz + vz * t - (0.5 * gravity * t * t if airborne else 0.0)
         dist = math.dist(muzzle, (px, py, pz))
-        t = min(max_lead_s, dist / max(1.0, proj_speed))
+        t = min(max_lead_s, max(0.0, dist - shot_offset) / max(1.0, proj_speed))
+    rz = tz + vz * t - (0.5 * gravity * t * t if airborne else 0.0)
+    if min_z is not None and rz < min_z:
+        rz = min_z
     return (
         tx + vx * t,
         ty + vy * t,
-        tz + vz * t - (0.5 * gravity * t * t if airborne else 0.0),
+        rz,
     )
 
 
@@ -137,6 +142,9 @@ class CombatPlanner:
         self.size_per_cube = float((config.get("cubes") or {}).get("size_per_cube", 0.04))
         self._los_cache_tick: int = -1
         self._los_cache: Dict[int, bool] = {}
+        self._last_target_id: Optional[int] = None
+        self._last_target_t: float = -100.0
+        self.last_target_score: float = 0.0
 
     def _cached_los(self, tick: int, target_id: Optional[int], p0: Vec3, p1: Vec3) -> bool:
         if not self.world.loaded:
@@ -159,21 +167,25 @@ class CombatPlanner:
         obs: Dict[str, Any],
         threats: ThreatTracker,
         allow_long_range: bool = True,
+        phase: str = "MID_GAME",
+        prefer_avoid_unfavorable: bool = False,
     ) -> Optional[TrackedEnemy]:
         me = obs["self"]
         mx, my, mz = me["pos"]
+        cur_aim = me["aim"]
         stat_mh = float(me["stats"].get("muzzle_height", self.base_muzzle_h))
         scaled_mh = self.base_muzzle_h * (1.0 + self.size_per_cube * int(me.get("cubes", 0)))
         muzzle_z = mz + max(stat_mh, scaled_mh)
         muzzle = (mx, my, muzzle_z)
         now = float(obs["t"])
-        attackers = threats.recent_attackers(now, window=5.0)
+        attackers = threats.recent_attackers(now, window=4.5)
         my_weapons = [w["kind"] for w in me["weapons"] if w is not None]
 
         best: Optional[TrackedEnemy] = None
         best_score = -1e18
 
         tick = int(obs["tick"])
+        gun_noise_cap = 155.0 if phase == "LATE_GAME" else 165.0
         for e in threats.visible_enemies():
             t_center = (e.pos[0], e.pos[1], e.pos[2] + 4.5)
             dist = math.dist(muzzle, t_center)
@@ -187,11 +199,25 @@ class CombatPlanner:
             if not has_los and not (has_mortar and 18.0 <= dist <= 220.0):
                 continue
 
-            # Avoid broadcasting noisy long-range gun shots at full-HP non-attackers unless we have a laser or they are charging a laser at us
             yaw_e_to_me = math.atan2(my - e.pos[1], mx - e.pos[0])
             e_facing_err = abs(angle_diff(yaw_e_to_me, e.aim[0]))
+            horiz_dist = max(1.0, math.hypot(mx - e.pos[0], my - e.pos[1]))
+            closing_speed = ((mx - e.pos[0]) * e.vel[0] + (my - e.pos[1]) * e.vel[1]) / horiz_dist
+            hp_frac = e.hp / max(1.0, e.max_hp)
+
             if (
-                dist > 165.0
+                prefer_avoid_unfavorable
+                and e.id not in attackers
+                and dist > 75.0
+                and hp_frac > 0.72
+                and not (e.charging and e_facing_err < 0.40)
+                and closing_speed < 5.0
+            ):
+                continue
+
+            # Avoid broadcasting noisy long-range gun shots at full-HP non-attackers unless we have a laser or they are charging a laser at us
+            if (
+                dist > gun_noise_cap
                 and e.id not in attackers
                 and e.hp > 650.0
                 and "laser" not in my_weapons
@@ -200,28 +226,37 @@ class CombatPlanner:
                 continue
 
             score = 0.0
-            # Prioritize closer threats
-            score += max(0.0, 220.0 - dist) * 0.7
+            # Prioritize closer threats & active rushers
+            score += max(0.0, 220.0 - dist) * 0.78
+            score += max(0.0, closing_speed) * 4.5
+            if "lightning" in e.weapons and dist < 60.0:
+                score += 70.0
             # High priority for anyone who recently damaged us
             if e.id in attackers:
-                score += 120.0
+                score += 135.0
+                if dist < 80.0:
+                    score += 45.0
             # High priority for low-HP finishable enemies (cubes + placement!)
-            hp_frac = e.hp / max(1.0, e.max_hp)
-            score += (1.0 - hp_frac) * 140.0
-            if e.hp <= 350.0:
-                score += 90.0
+            score += (1.0 - hp_frac) * 145.0
+            if e.hp <= 360.0:
+                score += 95.0
             # Enemy aiming at us vs turned away from us (rear-armor 1.5x damage!)
             if e_facing_err < 0.35:
-                score += 65.0
+                score += 70.0
                 if e.charging:
-                    score += 80.0
+                    score += 95.0
             elif e_facing_err > math.pi * 0.5:
                 score += 75.0  # Exposed rear armor -> 1.5x damage!
             # Weapon triangle bonuses
             if "laser" in my_weapons and "mortar" in e.weapons:
-                score += 60.0  # +60% cookoff!
-            if "lightning" in my_weapons and "laser" in e.weapons and dist < 50.0:
-                score += 75.0  # short enemy laser!
+                score += 65.0  # +60% cookoff!
+            if "lightning" in my_weapons and "laser" in e.weapons and dist < 52.0:
+                score += 80.0  # short enemy laser!
+            # Target-switch hysteresis + torso slew tie-breaker
+            if e.id == self._last_target_id and (now - self._last_target_t) <= 1.2:
+                score += 34.0
+            yaw_me_to_e = math.atan2(e.pos[1] - my, e.pos[0] - mx)
+            score -= abs(angle_diff(yaw_me_to_e, cur_aim[0])) * 12.0
             if not has_los:
                 score -= 90.0  # Prefer direct LoS targets over blind mortar lobs
 
@@ -229,7 +264,10 @@ class CombatPlanner:
                 best_score = score
                 best = e
 
-        self.last_target_score: float = best_score if best is not None else 0.0
+        self.last_target_score = best_score if best is not None else 0.0
+        if best is not None:
+            self._last_target_id = best.id
+            self._last_target_t = now
         return best
 
     def _mortar_launch_clear(self, muzzle: Vec3, yaw: float, pitch: float, speed: float, gravity: float) -> bool:
@@ -262,6 +300,8 @@ class CombatPlanner:
         is_mech: bool = True,
         allow_fire: bool = True,
         laser_shorted: bool = False,
+        allow_laser_start: bool = True,
+        target_cubes: int = 0,
     ) -> CombatPlan:
         """Choose best weapon slot, compute aim, and determine trigger state."""
         me = obs["self"]
@@ -276,6 +316,13 @@ class CombatPlanner:
         dist = math.dist(muzzle, target_pos)
         has_los = self._cached_los(int(obs["tick"]), target_id, muzzle, target_pos)
 
+        target_r = (2.5 * (1.0 + self.size_per_cube * target_cubes)) if is_mech else 1.6
+        lead_min_z: Optional[float] = (
+            (self.world.terrain_height(target_pos[0], target_pos[1]) + 1.5)
+            if (self.world.loaded and is_mech)
+            else None
+        )
+
         fire = [False, False]
         chosen_aim: Optional[Tuple[float, float]] = None
         chosen_kind: Optional[str] = None
@@ -286,24 +333,59 @@ class CombatPlanner:
             if w is not None:
                 slot_by_kind[w["kind"]] = (i, w)
 
-        # If a laser is ALREADY charging (and not shorted), finish and release it cleanly!
+        # 0. If a laser is ALREADY charging (and not shorted), dual-fire gun while charging & release cleanly!
         if not laser_shorted and "laser" in slot_by_kind and float(slot_by_kind["laser"][1].get("charge", 0.0)) > 0.0:
             idx, lw = slot_by_kind["laser"]
             stats = lw["stats"]
             charge = float(lw.get("charge", 0.0))
             full_charge = float(stats.get("charge", 0.75))
-            aim = aim_angles(muzzle, target_pos)
-            aim = (aim[0], self._clamp_pitch(aim[1]))
-            chosen_aim = aim
+            l_range = float(stats.get("range", 280.0))
+
+            hitscan_pt = (
+                target_pos[0] + target_vel[0] * 0.05,
+                target_pos[1] + target_vel[1] * 0.05,
+                target_pos[2],
+            )
+            raw_h = aim_angles(muzzle, hitscan_pt)
+            hitscan_aim = (raw_h[0], self._clamp_pitch(raw_h[1]))
+            chosen_aim = hitscan_aim
             chosen_kind = "laser"
-            yaw_err = abs(angle_diff(aim[0], cur_aim[0]))
-            pitch_err = abs(aim[1] - cur_aim[1])
-            on_target = yaw_err <= 0.065 and pitch_err <= 0.08
+
+            yaw_tol = max(0.028, min(0.065, (target_r + 0.65) / max(15.0, dist)))
+            pitch_tol = 0.075
+            on_target = abs(angle_diff(hitscan_aim[0], cur_aim[0])) <= yaw_tol and abs(hitscan_aim[1] - cur_aim[1]) <= pitch_tol
             kill_charge = full_charge * 0.45 if target_hp <= 200.0 else full_charge * 0.88
-            if allow_fire and has_los and dist <= float(stats.get("range", 280.0)) and on_target and charge >= kill_charge:
+
+            ready_release = (
+                allow_fire
+                and has_los
+                and dist <= l_range
+                and ((charge >= kill_charge and on_target) or charge >= full_charge + 0.35)
+            )
+            if ready_release:
                 fire[idx] = False  # RELEASE triggers the hitscan beam!
-            elif charge < full_charge + 0.4 and has_los and allow_fire:
+            elif has_los and allow_fire and charge < full_charge + 0.4:
                 fire[idx] = True   # Keep charging until aligned
+                if "gun" in slot_by_kind:
+                    g_idx, gw = slot_by_kind["gun"]
+                    g_stats = gw["stats"]
+                    g_speed = float(g_stats.get("speed", 252.0))
+                    g_range = float(g_stats.get("range", 230.0))
+                    gun_ready = dist <= g_range - 2.0 and gw.get("ammo", 0) > 0 and float(gw.get("reload", 0.0)) <= 0.0
+                    g_lead = solve_lead_point(muzzle, target_pos, target_vel, g_speed, min_z=lead_min_z)
+                    g_raw = aim_angles(muzzle, g_lead)
+                    g_pitch_ok = (self.min_pitch - 0.03) <= g_raw[1] <= (self.max_pitch + 0.03)
+                    g_aim = (g_raw[0], self._clamp_pitch(g_raw[1]))
+                    if gun_ready and g_pitch_ok and charge < full_charge * 0.72 and target_hp > 200.0:
+                        chosen_aim = g_aim
+                    g_tol = max(0.045, min(0.14, (target_r + 1.4) / max(12.0, dist)))
+                    if (
+                        gun_ready
+                        and g_pitch_ok
+                        and abs(angle_diff(g_aim[0], cur_aim[0])) <= g_tol
+                        and abs(g_aim[1] - cur_aim[1]) <= 0.12
+                    ):
+                        fire[g_idx] = True
             else:
                 fire[idx] = False  # Release/cancel if lost LoS
             return CombatPlan(
@@ -315,31 +397,42 @@ class CombatPlanner:
                 weapon_kind=chosen_kind,
             )
 
-        # 1. Close range: Lightning (240 DPS, instant, 30 deg cone, shorts enemy laser)
+        # 1. Close range: Lightning + velocity-led Gun dual-fire
         if "lightning" in slot_by_kind and has_los and allow_fire:
             idx, w = slot_by_kind["lightning"]
             stats = w["stats"]
             l_range = float(stats.get("range", 45.0))
             l_cost = float(stats.get("energy", 3.0))
-            min_e = l_cost * 1.2 if target_hp <= 250.0 else max(l_cost * 3.0, 8.0)
-            if dist <= l_range - 1.5 and energy >= min_e:
-                aim = aim_angles(muzzle, target_pos)
-                aim = (aim[0], self._clamp_pitch(aim[1]))
-                chosen_aim = aim
+            min_e = l_cost * 1.2 if target_hp <= 280.0 else max(l_cost * 3.0, 9.0)
+            if dist <= l_range - 1.2 and energy >= min_e:
+                direct_raw = aim_angles(muzzle, target_pos)
+                direct_aim = (direct_raw[0], self._clamp_pitch(direct_raw[1]))
+                chosen_aim = direct_aim
                 chosen_kind = "lightning"
                 cone_rad = math.radians(float(stats.get("cone_deg", 30.0))) * 0.45
-                if abs(angle_diff(aim[0], cur_aim[0])) <= cone_rad:
-                    fire[idx] = True
-                # Dual-fire gun only if both yaw and pitch are aligned
+
                 if "gun" in slot_by_kind:
                     g_idx, gw = slot_by_kind["gun"]
+                    g_stats = gw["stats"]
+                    g_speed = float(g_stats.get("speed", 252.0))
+                    g_range = float(g_stats.get("range", 230.0))
+                    gun_ready = dist <= g_range - 2.0 and gw.get("ammo", 0) > 0 and float(gw.get("reload", 0.0)) <= 0.0
+                    g_lead = solve_lead_point(muzzle, target_pos, target_vel, g_speed, min_z=lead_min_z)
+                    g_raw = aim_angles(muzzle, g_lead)
+                    g_pitch_ok = (self.min_pitch - 0.03) <= g_raw[1] <= (self.max_pitch + 0.03)
+                    g_aim = (g_raw[0], self._clamp_pitch(g_raw[1]))
+                    if gun_ready and g_pitch_ok and abs(angle_diff(g_aim[0], direct_aim[0])) <= cone_rad * 0.70:
+                        chosen_aim = g_aim
                     if (
-                        gw.get("ammo", 0) > 0
-                        and float(gw.get("reload", 0.0)) <= 0.0
-                        and abs(angle_diff(aim[0], cur_aim[0])) <= 0.14
-                        and abs(aim[1] - cur_aim[1]) <= 0.14
+                        gun_ready
+                        and g_pitch_ok
+                        and abs(angle_diff(g_aim[0], cur_aim[0])) <= 0.14
+                        and abs(g_aim[1] - cur_aim[1]) <= 0.14
                     ):
                         fire[g_idx] = True
+
+                if abs(angle_diff(direct_aim[0], cur_aim[0])) <= cone_rad:
+                    fire[idx] = True
                 return CombatPlan(
                     aim=[chosen_aim[0], chosen_aim[1]],
                     fire=fire,
@@ -350,13 +443,20 @@ class CombatPlanner:
                 )
 
         # 2. Mid/Long range: Laser (315 dmg hitscan, +60% cookoff vs mortar)
-        if not laser_shorted and "laser" in slot_by_kind and is_mech and has_los and allow_fire:
+        if allow_laser_start and not laser_shorted and "laser" in slot_by_kind and is_mech and has_los and allow_fire:
             idx, w = slot_by_kind["laser"]
             stats = w["stats"]
             l_range = float(stats.get("range", 280.0))
             cd = float(w.get("cooldown", 0.0))
-            prefer_laser = dist > 50.0 or (target_weapons and "mortar" in target_weapons)
-            if cd <= 0.05 and dist <= l_range - 5.0 and prefer_laser:
+            prefer_laser = dist > 52.0 or (target_weapons and "mortar" in target_weapons)
+            gun_quick_finish = (
+                target_hp <= 95.0
+                and dist <= 140.0
+                and "gun" in slot_by_kind
+                and slot_by_kind["gun"][1].get("ammo", 0) > 0
+                and float(slot_by_kind["gun"][1].get("reload", 0.0)) <= 0.0
+            )
+            if cd <= 0.05 and dist <= l_range - 5.0 and prefer_laser and not gun_quick_finish:
                 raw_aim = aim_angles(muzzle, target_pos)
                 pitch_in_bounds = (self.min_pitch - 0.03) <= raw_aim[1] <= (self.max_pitch + 0.03)
                 aim = (raw_aim[0], self._clamp_pitch(raw_aim[1]))
@@ -364,6 +464,19 @@ class CombatPlanner:
                 chosen_kind = "laser"
                 if allow_fire and pitch_in_bounds and abs(angle_diff(aim[0], cur_aim[0])) <= 0.25:
                     fire[idx] = True  # Start charging!
+                    if "gun" in slot_by_kind:
+                        g_idx, gw = slot_by_kind["gun"]
+                        g_stats = gw["stats"]
+                        g_speed = float(g_stats.get("speed", 252.0))
+                        g_range = float(g_stats.get("range", 230.0))
+                        if dist <= g_range - 2.0 and gw.get("ammo", 0) > 0 and float(gw.get("reload", 0.0)) <= 0.0:
+                            g_lead = solve_lead_point(muzzle, target_pos, target_vel, g_speed, min_z=lead_min_z)
+                            g_raw = aim_angles(muzzle, g_lead)
+                            g_pitch_ok = (self.min_pitch - 0.03) <= g_raw[1] <= (self.max_pitch + 0.03)
+                            g_aim = (g_raw[0], self._clamp_pitch(g_raw[1]))
+                            g_tol = min(0.16, max(0.032, (target_r + 1.35) / max(10.0, dist)))
+                            if g_pitch_ok and abs(angle_diff(g_aim[0], cur_aim[0])) <= g_tol and abs(g_aim[1] - cur_aim[1]) <= 0.12:
+                                fire[g_idx] = True
                 return CombatPlan(
                     aim=[chosen_aim[0], chosen_aim[1]],
                     fire=fire,
@@ -380,7 +493,7 @@ class CombatPlanner:
             stats = w["stats"]
             g_speed = float(stats.get("speed", 252.0))
             g_range = float(stats.get("range", 230.0))
-            lead_pt = solve_lead_point(muzzle, target_pos, target_vel, g_speed)
+            lead_pt = solve_lead_point(muzzle, target_pos, target_vel, g_speed, min_z=lead_min_z)
             raw_aim = aim_angles(muzzle, lead_pt)
             pitch_in_bounds = (self.min_pitch - 0.03) <= raw_aim[1] <= (self.max_pitch + 0.03)
             aim = (raw_aim[0], self._clamp_pitch(raw_aim[1]))
@@ -389,7 +502,7 @@ class CombatPlanner:
                 chosen_aim = aim
                 chosen_kind = "gun"
                 if allow_fire and pitch_in_bounds:
-                    tol = 0.16 if dist < 45.0 else (0.10 if dist < 110.0 else 0.065)
+                    tol = min(0.16, max(0.032, (target_r + 1.35) / max(10.0, dist)))
                     if abs(angle_diff(aim[0], cur_aim[0])) <= tol and abs(aim[1] - cur_aim[1]) <= 0.12:
                         fire[idx] = True
                 return CombatPlan(
