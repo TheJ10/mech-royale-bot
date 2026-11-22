@@ -44,13 +44,21 @@ _WEAPON_RANK: Dict[str, int] = {
 
 
 class LootObjective:
-    __slots__ = ("kind", "pos", "target_id", "score")
+    __slots__ = ("kind", "pos", "target_id", "score", "standoff_pos")
 
-    def __init__(self, kind: str, pos: Vec3, target_id: Optional[int], score: float):
+    def __init__(
+        self,
+        kind: str,
+        pos: Vec3,
+        target_id: Optional[int],
+        score: float,
+        standoff_pos: Optional[Vec2] = None,
+    ):
         self.kind = kind  # "cube" | "pickup" | "crate" | "npc" | "drop"
         self.pos = pos
         self.target_id = target_id
         self.score = score
+        self.standoff_pos = standoff_pos
 
 
 class ResourcePlanner:
@@ -61,6 +69,124 @@ class ResourcePlanner:
         self.config = config
         self.pacifist = pacifist
         self.pickup_radius = float(config.get("loot", {}).get("pickup_radius", 4.0))
+        crates_cfg = config.get("crates") or {}
+        mech_cfg = config.get("mech") or {}
+        cubes_cfg = config.get("cubes") or {}
+        self.crate_height = float(crates_cfg.get("height", 2.4))
+        self.crate_radius = float(crates_cfg.get("radius", 1.4))
+        self.min_pitch = float(mech_cfg.get("min_pitch", -0.7))
+        self.max_pitch = float(mech_cfg.get("max_pitch", 1.3))
+        self.base_muzzle_h = float(mech_cfg.get("muzzle_height", 7.0))
+        self.mech_radius = float(mech_cfg.get("radius", 2.5))
+        self.size_per_cube = float(cubes_cfg.get("size_per_cube", 0.04))
+        self._failed_crates: Dict[int, float] = {}
+
+    def mark_crate_failed(self, crate_id: int, now: float, cooldown_s: float = 35.0) -> None:
+        """Blacklist an unreachable or timed-out crate for `cooldown_s` seconds."""
+        self._failed_crates[int(crate_id)] = now + cooldown_s
+
+    def is_crate_blacklisted(self, crate_id: int, now: float) -> bool:
+        until = self._failed_crates.get(int(crate_id))
+        if until is None:
+            return False
+        if now >= until:
+            del self._failed_crates[int(crate_id)]
+            return False
+        return True
+
+    def effective_muzzle_height(self, me: Dict[str, Any]) -> float:
+        stat_mh = float((me.get("stats") or {}).get("muzzle_height", self.base_muzzle_h))
+        scaled_mh = self.base_muzzle_h * (1.0 + self.size_per_cube * int(me.get("cubes", 0)))
+        return max(stat_mh, scaled_mh)
+
+    def crate_aim_point(self, crate_pos: Vec3) -> Vec3:
+        """Upper-center aim point on crate cylinder (z + 0.6 * height = z + 1.44m)."""
+        return (float(crate_pos[0]), float(crate_pos[1]), float(crate_pos[2]) + self.crate_height * 0.6)
+
+    def min_crate_standoff(self, muzzle_z: float, target_z: float) -> float:
+        """Minimum horizontal standoff so downward/upward pitch stays within [min_pitch, max_pitch]."""
+        dz = target_z - muzzle_z
+        if dz < 0.0:
+            pitch_d = abs(dz) / math.tan(max(0.05, abs(self.min_pitch) - 0.04))
+        elif dz > 0.0:
+            pitch_d = dz / math.tan(max(0.05, self.max_pitch - 0.04))
+        else:
+            pitch_d = 0.0
+        return max(self.crate_radius + self.mech_radius + 1.5, pitch_d + 1.5)
+
+    def has_valid_crate_geometry(self, muzzle_pos: Vec3, crate_pos: Vec3) -> bool:
+        """True if muzzle_pos has valid pitch, standoff <= 48m, and clear LoS to crate aim point."""
+        target_pt = self.crate_aim_point(crate_pos)
+        dx = target_pt[0] - muzzle_pos[0]
+        dy = target_pt[1] - muzzle_pos[1]
+        d = math.hypot(dx, dy)
+        min_d = self.min_crate_standoff(muzzle_pos[2], target_pt[2])
+        if d < min_d - 0.5 or d > 48.0:
+            return False
+        pitch = math.atan2(target_pt[2] - muzzle_pos[2], max(1e-4, d))
+        if pitch < self.min_pitch + 0.03 or pitch > self.max_pitch - 0.03:
+            return False
+        if self.world.loaded and not self.world.has_los(muzzle_pos, target_pt, step=2.0):
+            return False
+        return True
+
+    def find_crate_firing_position(
+        self,
+        obs: Dict[str, Any],
+        crate_pos: Vec3,
+        threats: ThreatTracker,
+        zone_center: Vec2,
+        safe_radius: float,
+    ) -> Optional[Vec2]:
+        """Return current pos if already valid, else best walkable/zone-safe standoff point with LoS."""
+        me = obs["self"]
+        mx, my, mz = float(me["pos"][0]), float(me["pos"][1]), float(me["pos"][2])
+        now = float(obs["t"])
+        muzzle_h = self.effective_muzzle_height(me)
+        cx, cy, cz = float(crate_pos[0]), float(crate_pos[1]), float(crate_pos[2])
+
+        if (
+            math.hypot(mx - zone_center[0], my - zone_center[1]) <= safe_radius
+            and self.has_valid_crate_geometry((mx, my, mz + muzzle_h), crate_pos)
+        ):
+            return (mx, my)
+
+        target_pt = self.crate_aim_point(crate_pos)
+        min_d = self.min_crate_standoff(mz + muzzle_h, target_pt[2])
+        pref_d = max(min_d + 2.0, 11.5)
+        radii = (pref_d, min_d + 1.2, min(pref_d + 3.5, 18.0))
+        base_ang = math.atan2(my - cy, mx - cx)
+
+        best_pt: Optional[Vec2] = None
+        best_score = -1e18
+        for r in radii:
+            for k in range(12):
+                ang = base_ang + (math.tau * k) / 12.0
+                sx = cx + math.cos(ang) * r
+                sy = cy + math.sin(ang) * r
+                if self.world.loaded:
+                    if not self.world.in_bounds(sx, sy, margin=6.0):
+                        continue
+                    gx, gy = self.world.world_to_grid(sx, sy)
+                    if not self.world.is_cell_walkable(gx, gy):
+                        continue
+                    sz = self.world.terrain_height(sx, sy)
+                else:
+                    sz = mz
+                if math.hypot(sx - zone_center[0], sy - zone_center[1]) > safe_radius:
+                    continue
+                danger = threats.danger_at(sx, sy, now)
+                if danger > 3.2:
+                    continue
+                if not self.has_valid_crate_geometry((sx, sy, sz + muzzle_h), crate_pos):
+                    continue
+                travel = math.hypot(sx - mx, sy - my)
+                d_crate = math.hypot(sx - cx, sy - cy)
+                score = -travel - danger * 15.0 - abs(d_crate - pref_d) * 0.4
+                if score > best_score:
+                    best_score = score
+                    best_pt = (sx, sy)
+        return best_pt
 
     def choose_upgrade(self, obs: Dict[str, Any]) -> Optional[int]:
         offer = obs.get("offer")
@@ -160,7 +286,14 @@ class ResourcePlanner:
 
         best: Optional[LootObjective] = None
 
-        def consider(kind: str, pos: Vec3, tid: Optional[int], base_val: float, max_d: float) -> None:
+        def consider(
+            kind: str,
+            pos: Vec3,
+            tid: Optional[int],
+            base_val: float,
+            max_d: float,
+            standoff: Optional[Vec2] = None,
+        ) -> None:
             nonlocal best
             px, py, pz = pos
             if on_roof:
@@ -181,7 +314,7 @@ class ResourcePlanner:
                 return
             score = base_val * phase_econ_mult - d * 1.10 - danger * 18.0
             if score > 0.0 and (best is None or score > best.score):
-                best = LootObjective(kind, pos, tid, score)
+                best = LootObjective(kind, pos, tid, score, standoff_pos=standoff)
 
         # 1. Power cubes (free +4% HP & +4% damage + upgrades!)
         for c in obs.get("cubes") or []:
@@ -194,10 +327,17 @@ class ResourcePlanner:
                 if k in ("lightning", "laser") and k not in held_kinds:
                     consider("pickup", tuple(p["pos"]), int(p["id"]), 82.0, max_detour)
 
-        # 3. Crates (300 HP -> 1 cube + 50% weapon; skip noisy crate shooting if an enemy is close)
+        # 3. Crates (300 HP -> 1 cube + 50% weapon; validate firing geometry & standoff first!)
         if allow_noisy_farm and not self.pacifist and hp_frac >= 0.55:
             for cr in obs.get("crates") or []:
-                consider("crate", tuple(cr["pos"]), int(cr["id"]), 64.0 + threshold_bonus * 0.5, min(52.0, max_detour))
+                cid = int(cr["id"])
+                if self.is_crate_blacklisted(cid, now):
+                    continue
+                cpos = tuple(cr["pos"])
+                standoff = self.find_crate_firing_position(obs, cpos, threats, zone_center, safe_radius)
+                if standoff is None:
+                    continue
+                consider("crate", cpos, cid, 64.0 + threshold_bonus * 0.5, min(52.0, max_detour), standoff=standoff)
 
         # 4. NPC drones (350 HP -> 2 cubes! Dual-purpose: farm when healthy & isolated)
         if allow_noisy_farm and not self.pacifist and hp_frac >= 0.72 and not threats.visible_enemies():

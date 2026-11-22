@@ -1,4 +1,4 @@
-"""Entrypoint for the Mech Royale autonomous bot (experiment/tactical-survivor-v2)."""
+"""Entrypoint for the Mech Royale autonomous bot (experiment/unified-battle-intelligence-v2)."""
 import mechfight as mf
 from bot.controller import MechBot
 

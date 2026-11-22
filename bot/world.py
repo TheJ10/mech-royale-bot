@@ -529,29 +529,29 @@ class WorldModel:
                 return False
         return True
 
-    def find_cover_point(
+    def find_cover_candidates(
         self,
         my_pos: Vec3,
         threat_pos: Vec3,
         zone_center: Vec2,
         zone_radius: float,
-        search_radius: float = 56.0,
-    ) -> Optional[Vec2]:
-        """Find a walkable cell inside the safe zone that breaks LoS from `threat_pos`."""
+        search_radius: float = 62.0,
+        max_results: int = 6,
+    ) -> List[Tuple[Vec2, int]]:
+        """Find up to `max_results` walkable, zone-safe cover cells that break LoS from `threat_pos`."""
         if not self.loaded:
-            return None
-        mx, my, mz = my_pos
+            return []
+        mx, my, _ = my_pos
         tx, ty, tz = threat_pos
         t_eye = (tx, ty, tz + 7.5)
+        cur_d_threat = math.hypot(mx - tx, my - ty)
         gx0, gy0 = self.world_to_grid(mx, my)
         r_cells = max(2, int(search_radius / self.NAV_CELL))
         zcx, zcy = zone_center
         margin = min(6.0, zone_radius * 0.25)
         safe_r2 = max(0.0, zone_radius - margin) ** 2
 
-        # Collect candidate cover cells first using cheap 2D geometry, then test LoS on top 10 only
-        candidates: List[Tuple[float, float, float]] = []
-
+        candidates: List[Tuple[float, float, float, int]] = []
         for dy in range(-r_cells, r_cells + 1):
             gy = gy0 + dy
             if gy < 0 or gy >= self.nav_ny:
@@ -567,19 +567,37 @@ class WorldModel:
                 if (wx - zcx) ** 2 + (wy - zcy) ** 2 > safe_r2:
                     continue
                 d_me = math.hypot(wx - mx, wy - my)
-                if d_me < 6.0 or d_me > search_radius:
+                if d_me < 4.0 or d_me > search_radius:
                     continue
                 d_threat = math.hypot(wx - tx, wy - ty)
+                sep_gain = d_threat - cur_d_threat
                 deg = self.escape_deg[row + gx]
-                corner_bonus = 12.0 if 4 <= deg <= 6 else (-25.0 if deg <= 2 else 0.0)
-                score = d_threat * 0.85 - d_me * 1.35 + corner_bonus
-                candidates.append((score, wx, wy))
+                corner_bonus = 12.0 if 4 <= deg <= 6 else (-28.0 if deg <= 2 else 0.0)
+                score = sep_gain * 1.15 + d_threat * 0.35 - d_me * 0.55 + corner_bonus
+                candidates.append((score, wx, wy, deg))
 
         if not candidates:
-            return None
+            return []
         candidates.sort(key=lambda c: c[0], reverse=True)
-        for score, wx, wy in candidates[:10]:
+        out: List[Tuple[Vec2, int]] = []
+        for _, wx, wy, deg in candidates[:16]:
             wz = self.terrain_height(wx, wy)
             if not self.has_los(t_eye, (wx, wy, wz + 5.0), step=3.5):
-                return (wx, wy)
-        return None
+                out.append(((wx, wy), deg))
+                if len(out) >= max_results:
+                    break
+        return out
+
+    def find_cover_point(
+        self,
+        my_pos: Vec3,
+        threat_pos: Vec3,
+        zone_center: Vec2,
+        zone_radius: float,
+        search_radius: float = 56.0,
+    ) -> Optional[Vec2]:
+        """Find a walkable cell inside the safe zone that breaks LoS from `threat_pos`."""
+        cands = self.find_cover_candidates(
+            my_pos, threat_pos, zone_center, zone_radius, search_radius=search_radius, max_results=1
+        )
+        return cands[0][0] if cands else None

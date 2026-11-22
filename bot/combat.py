@@ -130,8 +130,11 @@ class CombatPlanner:
     def __init__(self, world: WorldModel, config: Dict[str, Any]):
         self.world = world
         self.config = config
-        self.min_pitch = float(config.get("mech", {}).get("min_pitch", -0.7))
-        self.max_pitch = float(config.get("mech", {}).get("max_pitch", 1.3))
+        mech_cfg = config.get("mech") or {}
+        self.min_pitch = float(mech_cfg.get("min_pitch", -0.7))
+        self.max_pitch = float(mech_cfg.get("max_pitch", 1.3))
+        self.base_muzzle_h = float(mech_cfg.get("muzzle_height", 7.0))
+        self.size_per_cube = float((config.get("cubes") or {}).get("size_per_cube", 0.04))
         self._los_cache_tick: int = -1
         self._los_cache: Dict[int, bool] = {}
 
@@ -159,7 +162,9 @@ class CombatPlanner:
     ) -> Optional[TrackedEnemy]:
         me = obs["self"]
         mx, my, mz = me["pos"]
-        muzzle_z = mz + float(me["stats"].get("muzzle_height", 7.0))
+        stat_mh = float(me["stats"].get("muzzle_height", self.base_muzzle_h))
+        scaled_mh = self.base_muzzle_h * (1.0 + self.size_per_cube * int(me.get("cubes", 0)))
+        muzzle_z = mz + max(stat_mh, scaled_mh)
         muzzle = (mx, my, muzzle_z)
         now = float(obs["t"])
         attackers = threats.recent_attackers(now, window=5.0)
@@ -261,7 +266,9 @@ class CombatPlanner:
         """Choose best weapon slot, compute aim, and determine trigger state."""
         me = obs["self"]
         mx, my, mz = me["pos"]
-        muzzle_z = mz + float(me["stats"].get("muzzle_height", 7.0))
+        stat_mh = float(me["stats"].get("muzzle_height", self.base_muzzle_h))
+        scaled_mh = self.base_muzzle_h * (1.0 + self.size_per_cube * int(me.get("cubes", 0)))
+        muzzle_z = mz + max(stat_mh, scaled_mh)
         muzzle = (mx, my, muzzle_z)
         cur_aim = me["aim"]
         energy = float(me["energy"])
@@ -350,11 +357,12 @@ class CombatPlanner:
             cd = float(w.get("cooldown", 0.0))
             prefer_laser = dist > 50.0 or (target_weapons and "mortar" in target_weapons)
             if cd <= 0.05 and dist <= l_range - 5.0 and prefer_laser:
-                aim = aim_angles(muzzle, target_pos)
-                aim = (aim[0], self._clamp_pitch(aim[1]))
+                raw_aim = aim_angles(muzzle, target_pos)
+                pitch_in_bounds = (self.min_pitch - 0.03) <= raw_aim[1] <= (self.max_pitch + 0.03)
+                aim = (raw_aim[0], self._clamp_pitch(raw_aim[1]))
                 chosen_aim = aim
                 chosen_kind = "laser"
-                if abs(angle_diff(aim[0], cur_aim[0])) <= 0.25:
+                if allow_fire and pitch_in_bounds and abs(angle_diff(aim[0], cur_aim[0])) <= 0.25:
                     fire[idx] = True  # Start charging!
                 return CombatPlan(
                     aim=[chosen_aim[0], chosen_aim[1]],
@@ -373,13 +381,14 @@ class CombatPlanner:
             g_speed = float(stats.get("speed", 252.0))
             g_range = float(stats.get("range", 230.0))
             lead_pt = solve_lead_point(muzzle, target_pos, target_vel, g_speed)
-            aim = aim_angles(muzzle, lead_pt)
-            aim = (aim[0], self._clamp_pitch(aim[1]))
+            raw_aim = aim_angles(muzzle, lead_pt)
+            pitch_in_bounds = (self.min_pitch - 0.03) <= raw_aim[1] <= (self.max_pitch + 0.03)
+            aim = (raw_aim[0], self._clamp_pitch(raw_aim[1]))
             gun_ready = dist <= g_range - 2.0 and w.get("ammo", 0) > 0 and float(w.get("reload", 0.0)) <= 0.0
             if gun_ready:
                 chosen_aim = aim
                 chosen_kind = "gun"
-                if allow_fire:
+                if allow_fire and pitch_in_bounds:
                     tol = 0.16 if dist < 45.0 else (0.10 if dist < 110.0 else 0.065)
                     if abs(angle_diff(aim[0], cur_aim[0])) <= tol and abs(aim[1] - cur_aim[1]) <= 0.12:
                         fire[idx] = True

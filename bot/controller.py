@@ -18,7 +18,7 @@ from bot.world import WorldModel
 
 
 class MechBot:
-    """Unified Battle Intelligence autonomous Mech Royale bot (UBI-v1)."""
+    """Unified Battle Intelligence autonomous Mech Royale bot (UBI-v2)."""
 
     profile_name = os.environ.get("MECH_PROFILE", "unified")
     name = PROFILES.get(profile_name, PROFILES["unified"]).bot_name
@@ -57,7 +57,8 @@ class MechBot:
         self.threats.update(obs)
         act, mode, goal = self.strategy.decide(obs)
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        self.telemetry.record_tick(obs, self.strategy.last_decision_meta, act, dt_ms)
+        if self.telemetry.file_enabled:
+            self.telemetry.record_tick(obs, self.strategy.last_decision_meta, act, dt_ms)
 
         me = obs["self"]
         x, y, z = me["pos"]

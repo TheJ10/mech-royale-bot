@@ -14,10 +14,16 @@ class DecisionTelemetry:
     MAX_RING = 80
     MAX_FILE_BYTES = 16 * 1024 * 1024  # 16 MB safety cap (well inside 64 MB /tmp limit)
 
-    def __init__(self, trace_path: Optional[str] = None, enabled: Optional[bool] = None):
+    def __init__(
+        self,
+        trace_path: Optional[str] = None,
+        enabled: Optional[bool] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
         env_path = os.environ.get("MECH_TELEMETRY_PATH", "").strip()
         self.trace_path: Optional[str] = trace_path if trace_path is not None else (env_path or None)
         self.file_enabled: bool = bool(self.trace_path) if enabled is None else bool(enabled and self.trace_path)
+        self.metadata: Dict[str, Any] = dict(metadata) if metadata else {}
         self.ring: Deque[Dict[str, Any]] = collections.deque(maxlen=self.MAX_RING)
         self._prev_record: Optional[Dict[str, Any]] = None
         self._prev_state: Optional[Dict[str, Any]] = None
@@ -37,6 +43,8 @@ class DecisionTelemetry:
         elapsed_ms: float,
     ) -> None:
         """Correlate previous decision's consequences with current obs, then record new decision."""
+        if not self.file_enabled:
+            return
         me = obs["self"]
         now = float(obs["t"])
         tick = int(obs["tick"])
@@ -84,6 +92,23 @@ class DecisionTelemetry:
             )
             unnecessary_exposure = bool(dmg_recv > 60.0 and dmg_dealt == 0.0 and obj_name not in ("RETREAT_HEAL", "ZONE_URGENT"))
 
+            cur_vis_e = [m for m in (obs.get("mechs") or []) if m.get("kind") == "mech"]
+            cur_min_edist = (
+                min(math.hypot(float(m["pos"][0]) - pos[0], float(m["pos"][1]) - pos[1]) for m in cur_vis_e)
+                if cur_vis_e else None
+            )
+            prev_min_edist = self._prev_state.get("min_enemy_dist")
+            retreat_sep_delta = (
+                round(cur_min_edist - prev_min_edist, 2)
+                if (obj_name == "RETREAT_HEAL" and cur_min_edist is not None and prev_min_edist is not None)
+                else None
+            )
+            retreat_los_broken = bool(
+                obj_name == "RETREAT_HEAL"
+                and self._prev_state.get("had_vis_enemy")
+                and not cur_vis_e
+            )
+
             self._prev_record["consequence"] = {
                 "next_tick": tick,
                 "displacement": disp,
@@ -96,6 +121,8 @@ class DecisionTelemetry:
                 "zone_damage": round(zone_dmg, 1),
                 "objective_achieved": bool(achieved),
                 "unnecessary_exposure": unnecessary_exposure,
+                "retreat_sep_delta": retreat_sep_delta,
+                "retreat_los_broken": retreat_los_broken,
             }
             self._flush_record(self._prev_record, elapsed_ms)
 
@@ -165,8 +192,19 @@ class DecisionTelemetry:
             "latency_ms": round(elapsed_ms, 2),
             "consequence": None,
         }
+        if self.metadata:
+            rec.update(self.metadata)
+        min_edist = min((e["dist"] for e in vis_e), default=None)
         self._prev_record = rec
-        self._prev_state = {"pos": pos, "hp": hp, "energy": energy, "cubes": cubes, "goal": goal}
+        self._prev_state = {
+            "pos": pos,
+            "hp": hp,
+            "energy": energy,
+            "cubes": cubes,
+            "goal": goal,
+            "min_enemy_dist": min_edist,
+            "had_vis_enemy": bool(vis_e),
+        }
 
     def finalize(self) -> None:
         """Flush final pending decision record if not yet written."""

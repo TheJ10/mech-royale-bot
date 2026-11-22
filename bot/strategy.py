@@ -29,7 +29,7 @@ class StrategyProfile:
 PROFILES: Dict[str, StrategyProfile] = {
     "unified": StrategyProfile(
         name="unified",
-        bot_name="ubi-v1",
+        bot_name="ubi-v2",
         pacifist=False,
         retreat_hp_frac=0.44,
         outnumbered_hp_frac=0.70,
@@ -41,7 +41,7 @@ PROFILES: Dict[str, StrategyProfile] = {
     ),
     "tactical_survivor": StrategyProfile(
         name="tactical_survivor",
-        bot_name="ubi-v1",
+        bot_name="ubi-v2",
         pacifist=False,
         retreat_hp_frac=0.44,
         outnumbered_hp_frac=0.70,
@@ -105,8 +105,121 @@ class StrategyController:
         self._anchor_t: float = -100.0
         self._cover_pt: Optional[Vec2] = None
         self._cover_t: float = -100.0
+        self._retreat_goal: Optional[Vec2] = None
+        self._retreat_goal_t: float = -100.0
+        self._crate_id: Optional[int] = None
+        self._crate_start_t: float = 0.0
+        self._crate_last_hp: float = 0.0
+        self._crate_last_progress_t: float = 0.0
+        self._crate_start_hp_me: float = 0.0
+        self._crate_fire_ticks: int = 0
         self._strafe_dir: float = 1.0
         self._last_strafe_flip_t: float = 0.0
+
+    def _choose_retreat_goal(
+        self,
+        obs: Dict[str, Any],
+        threat_ref: Vec3,
+        threat_vel: Vec3,
+        play_center: Vec2,
+        safe_play_r: float,
+    ) -> Tuple[Vec2, bool, float]:
+        """Select zone-safe retreat goal maximizing separation gain and LoS breaking without oscillation."""
+        me = obs["self"]
+        x, y, z = float(me["pos"][0]), float(me["pos"][1]), float(me["pos"][2])
+        now = float(obs["t"])
+        tx, ty, tz = float(threat_ref[0]), float(threat_ref[1]), float(threat_ref[2])
+        e_pred_x = tx + float(threat_vel[0]) * 1.5
+        e_pred_y = ty + float(threat_vel[1]) * 1.5
+        cur_d_threat = math.hypot(x - e_pred_x, y - e_pred_y)
+        t_eye = (tx, ty, tz + 7.5)
+        vis_npcs = self.threats.visible_npcs()
+
+        pool: List[Tuple[Vec2, int, bool, bool]] = []  # (pt, deg, prechecked_los, is_current)
+        if self.world.loaded:
+            for pt, deg in self.world.find_cover_candidates(
+                (x, y, z), threat_ref, play_center, max(8.0, safe_play_r), search_radius=62.0, max_results=6
+            ):
+                pool.append((pt, deg, True, False))
+
+        away_yaw = math.atan2(y - e_pred_y, x - e_pred_x)
+        step_r = min(44.0, max(10.0, safe_play_r * 0.85))
+        for off in (0.0, 0.45, -0.45, 0.9, -0.9):
+            ang = away_yaw + off
+            cx = x + math.cos(ang) * step_r
+            cy = y + math.sin(ang) * step_r
+            d_pc = math.hypot(cx - play_center[0], cy - play_center[1])
+            if d_pc > safe_play_r and d_pc > 1e-3:
+                scale = max(0.0, safe_play_r - 2.0) / d_pc
+                cx = play_center[0] + (cx - play_center[0]) * scale
+                cy = play_center[1] + (cy - play_center[1]) * scale
+            cx, cy = self.world.clamp_to_bounds(cx, cy, margin=6.0)
+            deg = 6
+            if self.world.loaded:
+                gx, gy = self.world.world_to_grid(cx, cy)
+                if not self.world.is_cell_walkable(gx, gy):
+                    gx, gy = self.world.nearest_walkable_cell(cx, cy, max_ring=4)
+                    if not self.world.is_cell_walkable(gx, gy):
+                        continue
+                    cx, cy = self.world.grid_to_world(gx, gy)
+                if self.world.escape_deg:
+                    deg = self.world.escape_deg[gy * self.world.nav_nx + gx]
+            pool.append(((cx, cy), deg, False, False))
+
+        if self._retreat_goal is not None:
+            rx, ry = self._retreat_goal
+            if math.hypot(rx - x, ry - y) > 5.0 and math.hypot(rx - play_center[0], ry - play_center[1]) <= max(4.0, safe_play_r):
+                pool.append(((rx, ry), 5, False, True))
+
+        best_pt: Vec2 = play_center
+        best_los = False
+        best_sep = 0.0
+        best_score = -1e18
+
+        for (wx, wy), deg, pre_los, is_cur in pool:
+            if math.hypot(wx - play_center[0], wy - play_center[1]) > max(4.0, safe_play_r) + 1.0:
+                continue
+            d_me = math.hypot(wx - x, wy - y)
+            if d_me < 2.5:
+                continue
+            d_threat = math.hypot(wx - e_pred_x, wy - e_pred_y)
+            sep_gain = d_threat - cur_d_threat
+
+            if pre_los:
+                breaks_los = True
+            elif self.world.loaded:
+                wz = self.world.terrain_height(wx, wy)
+                breaks_los = not self.world.has_los(t_eye, (wx, wy, wz + 5.0), step=3.5)
+            else:
+                breaks_los = False
+
+            danger = self.threats.danger_at(wx, wy, now, include_npcs=True)
+            npc_pen = 35.0 if any(math.hypot(wx - n["pos"][0], wy - n["pos"][1]) < 48.0 for n in vis_npcs) else 0.0
+            inward_margin = max(0.0, safe_play_r - math.hypot(wx - play_center[0], wy - play_center[1]))
+            zone_bonus = 12.0 if inward_margin >= 8.0 else 0.0
+            corner_bonus = 12.0 if 4 <= deg <= 6 else (-30.0 if deg <= 2 else 0.0)
+            commit_bonus = 18.0 if is_cur else 0.0
+
+            score = (
+                sep_gain * 1.35
+                - max(0.0, -sep_gain) * 2.2
+                + (45.0 if breaks_los else 0.0)
+                + corner_bonus
+                - danger * 26.0
+                - npc_pen
+                + zone_bonus
+                - d_me * 0.40
+                + commit_bonus
+            )
+            if score > best_score:
+                best_score = score
+                best_pt = (wx, wy)
+                best_los = breaks_los
+                best_sep = sep_gain
+
+        self._retreat_goal = best_pt
+        self._retreat_goal_t = now
+        return (best_pt, best_los, best_sep)
 
     def classify_phase(self, now: float, alive: int, next_radius: float) -> str:
         if next_radius <= 35.0 or alive <= 2:
@@ -260,12 +373,23 @@ class StrategyController:
 
         close_enemies = [e for e in vis_enemies if math.hypot(e.pos[0] - x, e.pos[1] - y) < 85.0]
         outnumbered = len(close_enemies) >= 2 and hp_frac < outnum_thresh
-        low_hp_threat = hp_frac < retreat_thresh and (
-            nearest_enemy is not None or self.threats.damage_taken_recent > 80.0
+        favourable_finish = (
+            nearest_enemy is not None
+            and not self.profile.pacifist
+            and nearest_enemy.hp <= 220.0
+            and hp > nearest_enemy.hp * 1.35
+            and len(close_enemies) <= 1
+            and not outnumbered
+        )
+        low_hp_threat = (
+            hp_frac < retreat_thresh
+            and not favourable_finish
+            and (nearest_enemy is not None or self.threats.damage_taken_recent > 80.0)
         )
         bad_duel = (
             nearest_enemy is not None
             and not self.profile.pacifist
+            and not favourable_finish
             and nearest_enemy.hp > hp * 1.45
             and nearest_enemy.hp > 450.0
             and hp_frac < 0.65
@@ -284,6 +408,8 @@ class StrategyController:
             or bad_duel
             or npc_emergency
         )
+        if not want_retreat:
+            self._retreat_goal = None
 
         # Candidate target & resource evaluation
         mech_target: Optional[TrackedEnemy] = None
@@ -306,6 +432,45 @@ class StrategyController:
                 allow_noisy_farm=(nearest_dist > 80.0),
                 phase_econ_mult=econ_mult,
             )
+            if loot_obj is not None and loot_obj.kind == "crate" and loot_obj.target_id is not None:
+                cid = int(loot_obj.target_id)
+                crate_hp = 300.0
+                for cr in obs.get("crates") or []:
+                    if int(cr["id"]) == cid:
+                        crate_hp = float(cr.get("hp", 300.0))
+                        break
+                if self._crate_id != cid:
+                    self._crate_id = cid
+                    self._crate_start_t = now
+                    self._crate_last_hp = crate_hp
+                    self._crate_last_progress_t = now
+                    self._crate_start_hp_me = hp
+                    self._crate_fire_ticks = 0
+                else:
+                    if crate_hp < self._crate_last_hp - 1.0:
+                        self._crate_last_hp = crate_hp
+                        self._crate_last_progress_t = now
+                    crate_timed_out = (
+                        (now - self._crate_start_t) > 7.5
+                        or ((now - self._crate_last_progress_t) > 3.5 and self._crate_fire_ticks >= 10)
+                        or (self._crate_start_hp_me - hp) > 90.0
+                    )
+                    if crate_timed_out:
+                        self.resources.mark_crate_failed(cid, now, cooldown_s=35.0)
+                        self._crate_id = None
+                        loot_obj = self.resources.find_best_loot(
+                            obs,
+                            self.threats,
+                            play_center,
+                            safe_play_r,
+                            max_detour=self.profile.loot_detour_m,
+                            allow_noisy_farm=(nearest_dist > 80.0),
+                            phase_econ_mult=econ_mult,
+                        )
+            else:
+                self._crate_id = None
+        else:
+            self._crate_id = None
 
         # --- UTILITY SCORING ACROSS CANDIDATE OBJECTIVES ---
         local_danger = self.threats.danger_at(x, y, now, include_npcs=(hp_frac < 0.65))
@@ -395,31 +560,35 @@ class StrategyController:
 
             if nearest_enemy is not None:
                 threat_ref = nearest_enemy.pos
+                threat_vel = nearest_enemy.vel
             elif npc_emergency and self.threats.visible_npcs():
-                threat_ref = self.threats.visible_npcs()[0]["pos"]
+                n0 = self.threats.visible_npcs()[0]
+                threat_ref = tuple(n0["pos"])
+                threat_vel = tuple(n0.get("vel", (0.0, 0.0, 0.0)))
             else:
                 threat_ref = (
                     x + math.cos(self.threats.rear_alert_bearing or 0.0) * 40.0,
                     y + math.sin(self.threats.rear_alert_bearing or 0.0) * 40.0,
                     z,
                 )
-            # Active moving retreat: pick cover point and keep moving if approached (never freeze for 55 ticks!)
-            if self._cover_pt is None or (now - self._cover_t) > 1.5 or math.hypot(self._cover_pt[0] - x, self._cover_pt[1] - y) < 6.0:
-                self._cover_pt = self.world.find_cover_point(pos3, threat_ref, play_center, play_radius)
-                self._cover_t = now
-            cover_pt = self._cover_pt
-            if cover_pt is not None:
-                goal = cover_pt
-            else:
-                away_yaw = math.atan2(y - threat_ref[1], x - threat_ref[0])
-                step_r = min(45.0, max(6.0, safe_play_r))
-                cand_x = x + math.cos(away_yaw) * step_r
-                cand_y = y + math.sin(away_yaw) * step_r
-                if math.hypot(cand_x - play_center[0], cand_y - play_center[1]) <= max(1.0, safe_play_r):
-                    goal = self.world.clamp_to_bounds(cand_x, cand_y)
-                else:
-                    goal = self._pick_quiet_zone_anchor(obs, next_center, next_radius, avoid_npcs=True)
-            want_boost = energy > 22.0 and (nearest_dist < 70.0 or dodge_vec is not None)
+                threat_vel = (0.0, 0.0, 0.0)
+            goal, _, _ = self._choose_retreat_goal(obs, threat_ref, threat_vel, play_center, safe_play_r)
+            enemy_has_los = nearest_enemy is not None and (
+                (not self.world.loaded)
+                or self.world.has_los(
+                    (nearest_enemy.pos[0], nearest_enemy.pos[1], nearest_enemy.pos[2] + 7.0),
+                    (x, y, z + 5.0),
+                    step=3.5,
+                )
+            )
+            want_boost = (
+                (dodge_vec is not None and energy > 12.0)
+                or (
+                    (enemy_has_los or self.threats.damage_taken_recent > 40.0)
+                    and (nearest_dist < 115.0 or hp_frac < 0.35)
+                    and (energy > 25.0 or (hp_frac < 0.28 and energy > 14.0))
+                )
+            )
             danger_weight = 3.5
             avoid_npcs_nav = True
 
@@ -427,7 +596,7 @@ class StrategyController:
                 t_center = (nearest_enemy.pos[0], nearest_enemy.pos[1], nearest_enemy.pos[2] + 4.5)
                 allow_defensive_fire = (
                     not self.profile.pacifist
-                    and (nearest_enemy.hp <= 240.0 or nearest_dist < 35.0)
+                    and (nearest_enemy.hp <= 260.0 or nearest_dist < 42.0)
                 )
                 combat_plan = self.combat.plan_attack_on_point(
                     obs, t_center, nearest_enemy.vel, nearest_enemy.id,
@@ -512,7 +681,13 @@ class StrategyController:
             self.mode = f"LOOT_{loot_obj.kind.upper()}"
             reasons.append(f"ACQUIRE_{loot_obj.kind.upper()}")
             lx, ly = loot_obj.pos[0], loot_obj.pos[1]
-            if loot_obj.kind == "drop" and math.hypot(lx - x, ly - y) < 6.0:
+            if loot_obj.kind == "crate":
+                if loot_obj.standoff_pos is not None:
+                    goal = loot_obj.standoff_pos
+                else:
+                    ang_c = math.atan2(y - ly, x - lx)
+                    goal = self.world.clamp_to_bounds(lx + math.cos(ang_c) * 11.5, ly + math.sin(ang_c) * 11.5)
+            elif loot_obj.kind == "drop" and math.hypot(lx - x, ly - y) < 6.0:
                 ang = now * 1.8
                 goal = (lx + math.cos(ang) * 3.5, ly + math.sin(ang) * 3.5)
             elif loot_obj.kind == "npc" and not self.profile.pacifist:
@@ -525,12 +700,22 @@ class StrategyController:
             else:
                 goal = (lx, ly)
             want_boost = False
-            if loot_obj.kind in ("crate", "npc") and not self.profile.pacifist:
-                z_off = 1.2 if loot_obj.kind == "crate" else 1.8
-                t_pos = (loot_obj.pos[0], loot_obj.pos[1], loot_obj.pos[2] + z_off)
+            if loot_obj.kind == "crate" and not self.profile.pacifist:
+                t_pos = self.resources.crate_aim_point(loot_obj.pos)
+                muzzle_h = self.resources.effective_muzzle_height(me)
+                geom_ok = self.resources.has_valid_crate_geometry((x, y, z + muzzle_h), loot_obj.pos)
                 combat_plan = self.combat.plan_attack_on_point(
                     obs, t_pos, (0.0, 0.0, 0.0), loot_obj.target_id,
-                    None, 300.0 if loot_obj.kind == "crate" else 350.0,
+                    None, 300.0,
+                    is_mech=False, allow_fire=geom_ok, laser_shorted=laser_shorted,
+                )
+                if any(combat_plan.fire):
+                    self._crate_fire_ticks += 1
+            elif loot_obj.kind == "npc" and not self.profile.pacifist:
+                t_pos = (loot_obj.pos[0], loot_obj.pos[1], loot_obj.pos[2] + 1.8)
+                combat_plan = self.combat.plan_attack_on_point(
+                    obs, t_pos, (0.0, 0.0, 0.0), loot_obj.target_id,
+                    None, 350.0,
                     is_mech=False, allow_fire=True, laser_shorted=laser_shorted,
                 )
 

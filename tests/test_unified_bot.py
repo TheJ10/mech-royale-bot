@@ -19,7 +19,7 @@ class TestUnifiedBattleIntelligence(unittest.TestCase):
         self.bot = MechBot(make_hello(ARENA_DIR))
 
     def test_01_bot_name_and_unified_profile(self):
-        self.assertEqual(self.bot.name, "ubi-v1")
+        self.assertEqual(self.bot.name, "ubi-v2")
         self.assertEqual(self.bot.profile.name, "unified")
         self.assertFalse(self.bot.profile.pacifist)
 
@@ -88,6 +88,221 @@ class TestUnifiedBattleIntelligence(unittest.TestCase):
             self.assertAlmostEqual(summary["total_damage_received"], 45.0)
             self.assertTrue(os.path.isfile(report_path))
             self.assertTrue(os.path.isfile(fail_path))
+
+    # --- Priority A: Crate Geometry & Anti-Deadlock Regression Tests ---
+
+    def test_07_crate_valid_standoff_geometry_and_cube_scaling(self):
+        rp = self.bot.resources
+        d0 = rp.min_crate_standoff(muzzle_z=7.0, target_z=1.44)
+        self.assertGreaterEqual(d0, 8.0)
+        # More cubes -> taller muzzle_height -> larger required horizontal standoff
+        me_big = {"cubes": 10, "stats": {"muzzle_height": 7.0}}
+        mh_big = rp.effective_muzzle_height(me_big)
+        self.assertGreater(mh_big, 9.0)
+        d10 = rp.min_crate_standoff(muzzle_z=mh_big, target_z=1.44)
+        self.assertGreater(d10, d0)
+
+    def test_08_crate_invalid_close_range_holds_fire_and_backs_out(self):
+        bot = MechBot(make_hello())
+        crate = {"id": 1001, "pos": [2.0, 0.0, 0.0], "hp": 300.0}
+        obs = make_obs(pos=[0.0, 0.0, 0.0], aim=[0.0, -0.7], crates=[crate])
+        act = bot.act(obs)
+        self.assertEqual(bot.strategy.mode, "LOOT_CRATE")
+        self.assertFalse(act["fire"][0], "Must not fire when inside min crate standoff")
+        gx, gy = bot.strategy.last_decision_meta["goal"]
+        self.assertGreaterEqual(math.hypot(gx - 2.0, gy - 0.0), 8.5)
+
+    def test_09_crate_successful_acquisition_from_valid_standoff(self):
+        bot = MechBot(make_hello())
+        crate = {"id": 1002, "pos": [12.0, 0.0, 0.0], "hp": 300.0}
+        # Pre-aligned toward z + 1.44 at d=12 -> pitch = atan2(1.44 - 7.0, 12.0) = -0.434
+        obs = make_obs(pos=[0.0, 0.0, 0.0], aim=[0.0, -0.434], crates=[crate])
+        act = bot.act(obs)
+        self.assertEqual(bot.strategy.mode, "LOOT_CRATE")
+        self.assertTrue(act["fire"][0])
+        self.assertAlmostEqual(act["aim"][1], math.atan2(1.44 - 7.0, 12.0), places=2)
+
+    def test_10_crate_blocked_los_rejected_before_entering_loot_crate(self):
+        bot = MechBot(make_hello())
+        # Enclose crate in a 6x6 building prism so no standoff angle has LoS
+        wall = Prism("building", -20.0, 30.0, [9.0, -3.0, 15.0, -3.0, 15.0, 3.0, 9.0, 3.0], [])
+        bot.world.load_synthetic((-100.0, 100.0, -100.0, 100.0), [wall], flat_z=0.0)
+        crate = {"id": 1003, "pos": [12.0, 0.0, 0.0], "hp": 300.0}
+        obs = make_obs(pos=[0.0, 0.0, 0.0], crates=[crate])
+        bot.act(obs)
+        self.assertNotEqual(bot.strategy.mode, "LOOT_CRATE")
+
+    def test_11_crate_timeout_switches_to_alternative_objective(self):
+        bot = MechBot(make_hello())
+        crate = {"id": 1004, "pos": [12.0, 0.0, 0.0], "hp": 300.0}
+        cube = {"id": 5001, "pos": [-55.0, 0.0, 0.0]}
+        obs0 = make_obs(tick=10, t=1.0, pos=[0.0, 0.0, 0.0], aim=[0.0, -0.434], crates=[crate], cubes=[cube])
+        obs0["self"]["cubes"] = 1
+        bot.act(obs0)
+        self.assertEqual(bot.strategy.mode, "LOOT_CRATE")
+        # Advance > 7.5s with crate HP stuck at 300 -> must abandon & switch to LOOT_CUBE
+        obs1 = make_obs(tick=90, t=9.0, pos=[0.0, 0.0, 0.0], aim=[0.0, -0.434], crates=[crate], cubes=[cube])
+        obs1["self"]["cubes"] = 1
+        bot.act(obs1)
+        self.assertNotEqual(bot.strategy.mode, "LOOT_CRATE")
+        self.assertEqual(bot.strategy.mode, "LOOT_CUBE")
+
+    def test_12_blacklisted_crate_not_reselected_within_cooldown(self):
+        bot = MechBot(make_hello())
+        crate = {"id": 1005, "pos": [12.0, 0.0, 0.0], "hp": 300.0}
+        bot.resources.mark_crate_failed(1005, now=10.0, cooldown_s=35.0)
+        obs = make_obs(tick=120, t=12.0, pos=[0.0, 0.0, 0.0], crates=[crate])
+        bot.act(obs)
+        self.assertEqual(bot.strategy.mode, "SAFE_ROTATE")
+
+    def test_13_crate_elevated_terrain_adjusts_geometry(self):
+        bot = MechBot(make_hello())
+        bot.world.load_synthetic((-100.0, 100.0, -100.0, 100.0), [], flat_z=0.0)
+        # Crate at z=5.0m above flat ground -> target_z=6.44, muzzle_z=7.0 -> dz=-0.56 -> valid even closer
+        crate_high = {"id": 1006, "pos": [10.0, 0.0, 5.0], "hp": 300.0}
+        self.assertTrue(bot.resources.has_valid_crate_geometry((0.0, 0.0, 7.0), (10.0, 0.0, 5.0)))
+        # Crate 12m below elevated mech (muzzle_z=19.0, target_z=1.44 -> dz=-17.56): 10m is too steep!
+        self.assertFalse(bot.resources.has_valid_crate_geometry((0.0, 0.0, 19.0), (10.0, 0.0, 0.0)))
+        self.assertTrue(bot.resources.has_valid_crate_geometry((0.0, 0.0, 19.0), (26.0, 0.0, 0.0)))
+
+    # --- Priority B: Multi-Tick Retreat Effectiveness Regression Tests ---
+
+    def test_14_retreat_multi_tick_increases_separation_and_displacement(self):
+        bot = MechBot(make_hello())
+        px, py = 0.0, 0.0
+        ex, ey = 35.0, 0.0
+        start_d = math.hypot(px - ex, py - ey)
+        for step in range(15):
+            enemy = {
+                "id": 7, "kind": "mech", "pos": [ex, ey, 0.0], "vel": [-8.0, 0.0, 0.0],
+                "aim": [math.pi, 0.0], "hp": 1400.0, "max_hp": 1400.0, "cubes": 1, "weapons": ["gun"],
+            }
+            obs = make_obs(tick=100 + step * 2, t=10.0 + step * 0.1, pos=[px, py, 0.0], hp=420.0, mechs=[enemy])
+            act = bot.act(obs)
+            self.assertEqual(bot.strategy.mode, "RETREAT_HEAL")
+            px += act["move"][0] * 1.6
+            py += act["move"][1] * 1.6
+            ex -= 0.8  # pursuer chasing
+        end_d = math.hypot(px - ex, py - ey)
+        self.assertGreater(end_d, start_d)
+        self.assertLess(px, -5.0)
+
+    def test_15_retreat_breaks_los_behind_building_cover(self):
+        bot = MechBot(make_hello())
+        # Building prism to the west (-22..-12, -10..10) between cover cells and east enemy
+        wall = Prism("building", -20.0, 30.0, [-22.0, -12.0, -12.0, -12.0, -12.0, 12.0, -22.0, 12.0], [])
+        bot.world.load_synthetic((-120.0, 120.0, -120.0, 120.0), [wall], flat_z=0.0)
+        enemy = {
+            "id": 8, "kind": "mech", "pos": [45.0, 0.0, 0.0], "vel": [-5.0, 0.0, 0.0],
+            "aim": [math.pi, 0.0], "hp": 1400.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"],
+        }
+        obs = make_obs(pos=[0.0, 0.0, 0.0], hp=400.0, mechs=[enemy])
+        bot.act(obs)
+        gx, gy = bot.strategy.last_decision_meta["goal"]
+        self.assertFalse(bot.world.has_los((45.0, 0.0, 7.5), (gx, gy, 5.0), step=3.5))
+
+    def test_16_retreat_selective_boost_preserves_energy_when_los_broken(self):
+        bot = MechBot(make_hello())
+        wall = Prism("building", -20.0, 30.0, [10.0, -15.0, 20.0, -15.0, 20.0, 15.0, 10.0, 15.0], [])
+        bot.world.load_synthetic((-120.0, 120.0, -120.0, 120.0), [wall], flat_z=0.0)
+        # Enemy behind wall (no LoS) -> still in retreat via recent damage, but must NOT burn boost
+        enemy_hidden = {
+            "id": 9, "kind": "mech", "pos": [40.0, 0.0, 0.0], "vel": [0.0, 0.0, 0.0],
+            "aim": [math.pi, 0.0], "hp": 1400.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"],
+        }
+        obs_no_los = make_obs(pos=[0.0, 0.0, 0.0], hp=420.0, energy=80.0, mechs=[enemy_hidden])
+        act_no_los = bot.act(obs_no_los)
+        self.assertFalse(act_no_los["boost"], "Should preserve energy once LoS is broken and no incoming fire")
+
+        # Enemy with direct LoS -> should boost while energy > 25
+        obs_los = make_obs(pos=[0.0, 40.0, 0.0], hp=420.0, energy=80.0, mechs=[enemy_hidden])
+        act_los = bot.act(obs_los)
+        self.assertTrue(act_los["boost"])
+
+    def test_17_retreat_stays_inside_safe_zone(self):
+        bot = MechBot(make_hello())
+        enemy = {
+            "id": 10, "kind": "mech", "pos": [0.0, 0.0, 0.0], "vel": [0.0, 0.0, 0.0],
+            "aim": [0.0, 0.0], "hp": 1400.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"],
+        }
+        # Bot near east zone edge (45, 0) with next_radius=60 -> must not pick retreat goal outside safe zone
+        obs = make_obs(
+            pos=[45.0, 0.0, 0.0],
+            hp=400.0,
+            mechs=[enemy],
+            zone={
+                "center": [0.0, 0.0], "radius": 60.0,
+                "next_center": [0.0, 0.0], "next_radius": 60.0,
+                "shrink_start": 100.0, "shrink_end": 130.0, "dps": 20.0,
+            },
+        )
+        bot.act(obs)
+        gx, gy = bot.strategy.last_decision_meta["goal"]
+        self.assertLessEqual(math.hypot(gx, gy), 56.0)
+
+    def test_18_retreat_avoids_npc_aggro_zone(self):
+        bot = MechBot(make_hello())
+        enemy = {
+            "id": 11, "kind": "mech", "pos": [50.0, 0.0, 0.0], "vel": [0.0, 0.0, 0.0],
+            "aim": [math.pi, 0.0], "hp": 1400.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"],
+        }
+        npc = {"id": 111, "kind": "npc", "pos": [-42.0, 0.0, 0.0], "vel": [0, 0, 0], "aim": [0, 0], "hp": 350, "max_hp": 350}
+        obs = make_obs(pos=[0.0, 0.0, 0.0], hp=400.0, mechs=[enemy, npc])
+        bot.act(obs)
+        gx, gy = bot.strategy.last_decision_meta["goal"]
+        self.assertGreater(math.hypot(gx - (-42.0), gy - 0.0), 25.0)
+
+    def test_19_retreat_recovers_when_threat_disappears_or_favourable_finish(self):
+        bot = MechBot(make_hello())
+        enemy_full = {
+            "id": 12, "kind": "mech", "pos": [35.0, 0.0, 0.0], "vel": [0.0, 0.0, 0.0],
+            "aim": [math.pi, 0.0], "hp": 1400.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"],
+        }
+        bot.act(make_obs(tick=10, t=1.0, pos=[0.0, 0.0, 0.0], hp=420.0, mechs=[enemy_full]))
+        self.assertEqual(bot.strategy.mode, "RETREAT_HEAL")
+
+        # Threat disappears -> exits RETREAT_HEAL
+        bot.act(make_obs(tick=120, t=12.0, pos=[0.0, 0.0, 0.0], hp=420.0, mechs=[]))
+        self.assertNotEqual(bot.strategy.mode, "RETREAT_HEAL")
+
+        # Favourable finish: enemy at 150 HP, bot at 420 HP -> switches to COMBAT_KITE to finish
+        enemy_low = {
+            "id": 12, "kind": "mech", "pos": [35.0, 0.0, 0.0], "vel": [0.0, 0.0, 0.0],
+            "aim": [math.pi, 0.0], "hp": 150.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"],
+        }
+        bot.act(make_obs(tick=122, t=12.1, pos=[0.0, 0.0, 0.0], hp=420.0, mechs=[enemy_low]))
+        self.assertEqual(bot.strategy.mode, "COMBAT_KITE")
+
+    # --- Priority C: Zero-Cost Telemetry Bypass & Local Tracing Tests ---
+
+    def test_20_telemetry_disabled_mode_fast_path(self):
+        prev = os.environ.pop("MECH_TELEMETRY_PATH", None)
+        try:
+            bot = MechBot(make_hello(), trace_path=None)
+            self.assertFalse(bot.telemetry.file_enabled)
+            obs = make_obs(tick=10, t=1.0, pos=[0.0, 0.0, 0.0], hp=1400.0)
+            bot.act(obs)
+            self.assertEqual(len(bot.telemetry.ring), 0)
+            self.assertIsNone(bot.telemetry._prev_record)
+        finally:
+            if prev is not None:
+                os.environ["MECH_TELEMETRY_PATH"] = prev
+
+    def test_21_telemetry_enabled_records_retreat_outcomes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trace_file = os.path.join(tmpdir, "trace.jsonl")
+            bot = MechBot(make_hello(), trace_path=trace_file)
+            self.assertTrue(bot.telemetry.file_enabled)
+            e1 = {"id": 13, "kind": "mech", "pos": [30.0, 0.0, 0.0], "vel": [0, 0, 0], "aim": [math.pi, 0], "hp": 1400.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"]}
+            e2 = {"id": 13, "kind": "mech", "pos": [42.0, 0.0, 0.0], "vel": [0, 0, 0], "aim": [math.pi, 0], "hp": 1400.0, "max_hp": 1400.0, "cubes": 0, "weapons": ["gun"]}
+            bot.act(make_obs(tick=10, t=1.0, pos=[0.0, 0.0, 0.0], hp=400.0, mechs=[e1]))
+            bot.act(make_obs(tick=12, t=1.1, pos=[-2.0, 0.0, 0.0], hp=400.0, mechs=[e2]))
+            bot.telemetry.finalize()
+            with open(trace_file, "r", encoding="utf-8") as f:
+                first = json.loads(f.readline())
+            self.assertEqual(first["selected_objective"], "RETREAT_HEAL")
+            self.assertAlmostEqual(first["consequence"]["retreat_sep_delta"], 14.0, places=1)
+            self.assertFalse(first["consequence"]["retreat_los_broken"])
 
 
 if __name__ == "__main__":
